@@ -22,6 +22,10 @@
 
 #include <string.h>
 
+#ifdef _KERNEL_MODE
+#define abort() DbgBreakPoint()
+#endif
+
 #define STATE_INVALID 0
 #define STATE_AAD 1
 #define STATE_CIPHER 2

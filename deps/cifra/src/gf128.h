@@ -16,7 +16,12 @@
 #define GF128_H
 
 #include <stddef.h>
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
+
 
 /**
  * @brief Operations in GF(2^128).

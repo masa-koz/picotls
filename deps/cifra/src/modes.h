@@ -16,7 +16,11 @@
 #define MODES_H
 
 #include <stddef.h>
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
 
 #include "gf128.h"
 #include "prp.h"

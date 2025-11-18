@@ -19,6 +19,10 @@
 
 #include <string.h>
 
+#ifdef _KERNEL_MODE
+#define abort() DbgBreakPoint()
+#endif
+
 void cf_blockwise_accumulate(uint8_t *partial, size_t *npartial, size_t nblock,
                              const void *inp, size_t nbytes,
                              cf_blockwise_in_fn process,

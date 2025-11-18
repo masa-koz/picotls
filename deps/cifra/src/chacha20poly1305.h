@@ -15,7 +15,12 @@
 #ifndef CHACHA20POLY1305_H
 #define CHACHA20POLY1305_H
 
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
+
 #include <stddef.h>
 
 /**

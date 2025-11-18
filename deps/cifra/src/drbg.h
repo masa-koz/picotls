@@ -16,7 +16,11 @@
 #define DRBG_H
 
 #include <stddef.h>
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
 
 #include "chash.h"
 #include "hmac.h"

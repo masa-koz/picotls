@@ -4,7 +4,7 @@
  * Permission is hereby granted, free of charge, to any person obtaining a copy
  * of this software and associated documentation files (the "Software"), to
  * deal in the Software without restriction, including without limitation the
- * rights to use, copy, modify, merge, publish, distribute, sublicense, and/or
+ * rights to use, copy, modify, merge, publfish, distribute, sublicense, and/or
  * sell copies of the Software, and to permit persons to whom the Software is
  * furnished to do so, subject to the following conditions:
  *
@@ -30,10 +30,12 @@ extern "C" {
 #include "wincompat.h"
 #endif
 
+#ifndef _KERNEL_MODE
 #include <assert.h>
 #include <inttypes.h>
 #include <string.h>
 #include <sys/types.h>
+#endif
 
 #if __GNUC__ >= 3
 #define PTLS_LIKELY(x) __builtin_expect(!!(x), 1)
@@ -61,7 +63,11 @@ extern "C" {
 #define PTLS_ELEMENTSOF(x) (PTLS_ASSERT_IS_ARRAY_EXPR(x) * sizeof(x) / sizeof((x)[0]))
 
 #ifdef _WINDOWS
+#ifndef _KERNEL_MODE
 #define PTLS_THREADLOCAL __declspec(thread)
+#else
+#define PTLS_THREADLOCAL
+#endif
 #else
 #define PTLS_THREADLOCAL __thread
 #endif
@@ -2021,7 +2027,15 @@ inline void ptls_buffer_init(ptls_buffer_t *buf, void *smallbuf, size_t smallbuf
 inline void ptls_buffer_dispose(ptls_buffer_t *buf)
 {
     ptls_buffer__release_memory(buf);
+#ifndef _KERNEL_MODE
     *buf = (ptls_buffer_t){NULL, 0, 0, 0, 0};
+#else
+    buf->base = NULL;
+    buf->off = 0;
+    buf->capacity = 0;
+    buf->is_allocated = 0;
+    buf->align_bits = 0;
+#endif
 }
 
 inline uint8_t *ptls_encode_quicint(uint8_t *p, uint64_t v)

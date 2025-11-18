@@ -20,6 +20,10 @@
 
 #include <string.h>
 
+#ifdef _KERNEL_MODE
+#define abort() DbgBreakPoint()
+#endif
+
 #define MAX_DRBG_GENERATE 0x10000ul
 
 static void hash_df(const cf_chash *H,

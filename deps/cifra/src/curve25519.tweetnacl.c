@@ -3,7 +3,11 @@
  *
  * Original code was public domain. */
 
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
 #include <stddef.h>
 
 #include "handy.h"

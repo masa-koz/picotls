@@ -273,7 +273,9 @@ static void encrypt_body(norx32_ctx *ctx,
   uint8_t partial[RATE_BYTES];
   memset(partial, 0, sizeof partial);
   memcpy(partial, plain, nbytes);
-  partial[nbytes] ^= 0x01;
+  if (nbytes < RATE_BYTES) {
+    partial[nbytes] ^= 0x01;
+  }
   partial[sizeof(partial) - 1] ^= 0x80;
 
   switch_domain(ctx, DOMAIN_PAYLOAD);

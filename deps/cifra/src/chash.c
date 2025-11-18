@@ -16,6 +16,10 @@
 #include "handy.h"
 #include "tassert.h"
 
+#ifdef _KERNEL_MODE
+#define abort() DbgBreakPoint()
+#endif
+
 void cf_hash(const cf_chash *h, const void *m, size_t nm, uint8_t *out)
 {
   cf_chash_ctx ctx;

@@ -15,7 +15,12 @@
 #ifndef BITOPS_H
 #define BITOPS_H
 
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
+
 #include <stddef.h>
 
 #ifdef _WINDOWS

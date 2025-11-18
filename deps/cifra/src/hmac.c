@@ -20,6 +20,10 @@
 
 #include <string.h>
 
+#ifdef _KERNEL_MODE
+#define abort() DbgBreakPoint()
+#endif
+
 void cf_hmac_init(cf_hmac_ctx *ctx,
                   const cf_chash *hash,
                   const uint8_t *key, size_t nkey)

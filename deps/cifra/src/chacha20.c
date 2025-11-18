@@ -20,6 +20,10 @@
 #include <string.h>
 #include <stdlib.h>
 
+#ifdef _KERNEL_MODE
+#define abort() DbgBreakPoint()
+#endif
+
 void cf_chacha20_core(const uint8_t key0[16],
                       const uint8_t key1[16],
                       const uint8_t nonce[16],

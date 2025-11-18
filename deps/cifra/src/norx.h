@@ -15,7 +15,11 @@
 #ifndef NORX_H
 #define NORX_H
 
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
 #include <stddef.h>
 
 /**

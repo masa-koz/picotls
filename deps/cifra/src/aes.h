@@ -28,7 +28,11 @@
 #define AES_H
 
 #include <stddef.h>
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
 
 #include "prp.h"
 

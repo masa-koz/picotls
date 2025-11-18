@@ -48,7 +48,11 @@
 #include "curve25519.h"
 
 #include <string.h>
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "quic_platform.h"
+#endif
 
 #ifdef _MSC_VER
 #define inline __inline

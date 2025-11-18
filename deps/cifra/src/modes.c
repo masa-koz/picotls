@@ -20,7 +20,11 @@
 #include <string.h>
 #include "tassert.h"
 
-/* CBC */
+#ifdef _KERNEL_MODE
+#define abort() DbgBreakPoint()
+#endif
+
+ /* CBC */
 void cf_cbc_init(cf_cbc *ctx, const cf_prp *prp, void *prpctx, const uint8_t iv[CF_MAXBLOCK])
 {
   ctx->prp = prp;

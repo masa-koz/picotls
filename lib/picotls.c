@@ -22,12 +22,14 @@
 #ifdef _WINDOWS
 #include "wincompat.h"
 #endif
+#ifndef _KERNEL_MODE
 #include <assert.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#endif
 #ifndef _WINDOWS
 #include <errno.h>
 #include <pthread.h>
@@ -6549,9 +6551,13 @@ int (*volatile ptls_mem_equal)(const void *x, const void *y, size_t len) = mem_e
 
 static uint64_t get_time(ptls_get_time_t *self)
 {
+#ifndef _KERNEL_MODE
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#else
+    return CxPlatTimeEpochMs64();
+#endif
 }
 
 ptls_get_time_t ptls_get_time = {get_time};
@@ -6679,14 +6685,26 @@ int ptls_server_handle_message(ptls_t *tls, ptls_buffer_t *sendbuf, size_t epoch
 int ptls_server_name_is_ipaddr(const char *name)
 {
 #ifdef AF_INET
+#ifndef _KERNEL_MODE
     struct sockaddr_in sin;
     if (inet_pton(AF_INET, name, &sin) == 1)
         return 1;
+#else
+    struct in_addr in_addr;
+    if (RtlIpv4StringToAddressA((PCHAR)name, TRUE, NULL, &in_addr) == STATUS_SUCCESS)
+        return 1;
+#endif
 #endif
 #ifdef AF_INET6
+#ifndef _KERNEL_MODE
     struct sockaddr_in6 sin6;
     if (inet_pton(AF_INET6, name, &sin6) == 1)
         return 1;
+#else
+    struct in6_addr in6_addr;
+    if (RtlIpv6StringToAddressA((PCHAR)name, NULL, &in6_addr) == STATUS_SUCCESS)
+        return 1;
+#endif
 #endif
     return 0;
 }
