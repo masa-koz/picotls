@@ -6691,7 +6691,8 @@ int ptls_server_name_is_ipaddr(const char *name)
         return 1;
 #else
     struct in_addr in_addr;
-    if (RtlIpv4StringToAddressA((PCHAR)name, TRUE, NULL, &in_addr) == STATUS_SUCCESS)
+    PCHAR terminator;
+    if (RtlIpv4StringToAddressA((PCHAR)name, TRUE, &terminator, &in_addr) == STATUS_SUCCESS)
         return 1;
 #endif
 #endif

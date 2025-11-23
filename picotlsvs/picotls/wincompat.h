@@ -27,7 +27,17 @@
 
 #define malloc(SIZE) CXPLAT_ALLOC_PAGED(SIZE, 'ocip')
 
-#define free(PTR) CXPLAT_FREE(PTR, 'ocip')
+FORCEINLINE
+void
+_free(void* Ptr)
+{
+    if (Ptr == NULL) {
+        return;
+    }
+    CXPLAT_FREE(Ptr, 'ocip');
+}
+
+#define free(Ptr) _free(Ptr)
 
 #define _aligned_malloc(SIZE, ALIGNMENT) CXPLAT_ALLOC_PAGED(SIZE, 'ocip')
 
