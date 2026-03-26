@@ -2542,7 +2542,7 @@ static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_
             memcpy(tls->ech.client.first_ech.base,
                    emitter->buf->base + ech_size_offset - outer_ech_header_size(tls->ech.client.enc.len), len);
             tls->ech.client.first_ech.len = len;
-            if (properties->client.ech.configs.len != 0) {
+            if (properties != NULL && properties->client.ech.configs.len != 0) {
                 tls->ech.offered = 1;
             } else {
                 tls->ech.offered_grease = 1;
@@ -5092,6 +5092,7 @@ static int parse_record(ptls_t *tls, struct st_ptls_record_t *rec, const uint8_t
     while (tls->recvbuf.rec.off < 5) {
         if (src == end)
             return PTLS_ERROR_IN_PROGRESS;
+        assert(tls->recvbuf.rec.base != NULL);
         tls->recvbuf.rec.base[tls->recvbuf.rec.off++] = *src++;
     }
     if ((ret = parse_record_header(rec, tls->recvbuf.rec.base)) != 0)
@@ -5105,6 +5106,7 @@ static int parse_record(ptls_t *tls, struct st_ptls_record_t *rec, const uint8_t
         if (addlen > (size_t)(end - src))
             addlen = end - src;
         if (addlen != 0) {
+            assert((tls->recvbuf.rec.base + tls->recvbuf.rec.off) != 0);
             memcpy(tls->recvbuf.rec.base + tls->recvbuf.rec.off, src, addlen);
             tls->recvbuf.rec.off += addlen;
             src += addlen;
@@ -5847,6 +5849,7 @@ static int handle_handshake_record(ptls_t *tls,
             ptls_buffer_init(&tls->recvbuf.mess, "", 0);
             if ((ret = ptls_buffer_reserve(&tls->recvbuf.mess, new_size)) != 0)
                 return ret;
+            assert(tls->recvbuf.mess.base != 0);
             memcpy(tls->recvbuf.mess.base, src, new_size);
         } else {
             memmove(tls->recvbuf.mess.base, src, new_size);
@@ -6691,8 +6694,8 @@ int ptls_server_name_is_ipaddr(const char *name)
         return 1;
 #else
     struct in_addr in_addr;
-    PCHAR terminator;
-    if (RtlIpv4StringToAddressA((PCHAR)name, TRUE, &terminator, &in_addr) == STATUS_SUCCESS)
+    PCHAR terminator_in = NULL;
+    if (RtlIpv4StringToAddressA((PCHAR)name, TRUE, &terminator_in, &in_addr) == STATUS_SUCCESS)
         return 1;
 #endif
 #endif
@@ -6703,7 +6706,8 @@ int ptls_server_name_is_ipaddr(const char *name)
         return 1;
 #else
     struct in6_addr in6_addr;
-    if (RtlIpv6StringToAddressA((PCHAR)name, NULL, &in6_addr) == STATUS_SUCCESS)
+    PCHAR terminator_in6 = NULL;
+    if (RtlIpv6StringToAddressA((PCHAR)name, &terminator_in6, &in6_addr) == STATUS_SUCCESS)
         return 1;
 #endif
 #endif
