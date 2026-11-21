@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Common settings for the Windows kernel-mode static libraries of picotls (cifra.kernel, picotls-minicrypto.kernel).
+  Import this file right after Microsoft.Cpp.props.
+
+  The following properties may be overridden by the consumer (e.g. msquic), on the msbuild command line or in a
+  Directory.Build.props:
+    PtlsKernelBuildDir  root directory of the outputs (default: <picotls>\build\winkernel\<Platform>_<Configuration>\)
+-->
+<Project xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup>
+    <PtlsRootDir>$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)..\'))</PtlsRootDir>
+    <PtlsKernelBuildDir Condition="'$(PtlsKernelBuildDir)' == ''">$(PtlsRootDir)build\winkernel\$(Platform)_$(Configuration)\</PtlsKernelBuildDir>
+    <IntDir>$(PtlsKernelBuildDir)obj\$(ProjectName)\</IntDir>
+    <OutDir>$(PtlsKernelBuildDir)bin\</OutDir>
+    <!-- third-party code (cifra) does not pass the WDK code analysis rules -->
+    <RunCodeAnalysis>false</RunCodeAnalysis>
+    <ExternalIncludePath />
+  </PropertyGroup>
+  <ItemDefinitionGroup>
+    <ClCompile>
+      <!-- _KERNEL_MODE is defined by the compiler (/kernel) -->
+      <PreprocessorDefinitions>_WINDOWS;_LIB;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <PreprocessorDefinitions Condition="'$(Configuration)' == 'Debug'">_DEBUG;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+      <AdditionalIncludeDirectories>$(PtlsRootDir)include;$(PtlsRootDir)picotlsvs\picotls;$(PtlsRootDir)deps\cifra\src;$(PtlsRootDir)deps\cifra\src\ext;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalOptions>/Gw /kernel %(AdditionalOptions)</AdditionalOptions>
+      <WarningLevel>Level3</WarningLevel>
+      <TreatWarningAsError>false</TreatWarningAsError>
+      <FavorSizeOrSpeed>Speed</FavorSizeOrSpeed>
+      <WholeProgramOptimization Condition="'$(Configuration)' == 'Release'">true</WholeProgramOptimization>
+      <MultiProcessorCompilation>true</MultiProcessorCompilation>
+    </ClCompile>
+    <Lib>
+      <LinkTimeCodeGeneration Condition="'$(Configuration)' == 'Release'">true</LinkTimeCodeGeneration>
+    </Lib>
+  </ItemDefinitionGroup>
+</Project>

@@ -37,6 +37,16 @@ typedef UINT16 uint16_t;
 typedef UINT32 uint32_t;
 typedef UINT64 uint64_t;
 
+/* normally provided by vcruntime.h (via stddef.h); the guards are the same as the ones used there */
+#ifndef _INTPTR_T_DEFINED
+#define _INTPTR_T_DEFINED
+typedef LONG_PTR intptr_t;
+#endif
+#ifndef _UINTPTR_T_DEFINED
+#define _UINTPTR_T_DEFINED
+typedef ULONG_PTR uintptr_t;
+#endif
+
 #ifndef INT8_MIN
 #define INT8_MIN (-127i8 - 1)
 #endif
