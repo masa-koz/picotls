@@ -21,7 +21,6 @@
 #include "tassert.h"
 
 #ifdef _KERNEL_MODE
-#define UINT64_C(c) c##UL
 #define abort() DbgBreakPoint()
 #endif
 

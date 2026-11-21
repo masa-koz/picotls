@@ -6874,7 +6874,7 @@ static uint64_t get_time(ptls_get_time_t *self)
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
 #else
-    return CxPlatTimeEpochMs64();
+    return ptls_winkernel_time_epoch_ms();
 #endif
 }
 
@@ -7010,7 +7010,7 @@ int ptls_server_name_is_ipaddr(const char *name)
 #else
     struct in_addr in_addr;
     PCHAR terminator_in = NULL;
-    if (RtlIpv4StringToAddressA((PCHAR)name, TRUE, &terminator_in, &in_addr) == STATUS_SUCCESS)
+    if (RtlIpv4StringToAddressA((PCHAR)name, TRUE, &terminator_in, &in_addr) == STATUS_SUCCESS && *terminator_in == '\0')
         return 1;
 #endif
 #endif
@@ -7022,7 +7022,7 @@ int ptls_server_name_is_ipaddr(const char *name)
 #else
     struct in6_addr in6_addr;
     PCHAR terminator_in6 = NULL;
-    if (RtlIpv6StringToAddressA((PCHAR)name, &terminator_in6, &in6_addr) == STATUS_SUCCESS)
+    if (RtlIpv6StringToAddressA((PCHAR)name, &terminator_in6, &in6_addr) == STATUS_SUCCESS && *terminator_in6 == '\0')
         return 1;
 #endif
 #endif

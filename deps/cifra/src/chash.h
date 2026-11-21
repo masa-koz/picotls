@@ -19,7 +19,7 @@
 #ifndef _KERNEL_MODE
 #include <stdint.h>
 #else
-#include "quic_platform.h"
+#include "winkernel_types.h"
 #endif
 
 /**
