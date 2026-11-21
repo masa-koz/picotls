@@ -156,7 +156,7 @@ struct st_ptls_record_message_emitter_t {
 };
 
 struct st_ptls_signature_algorithms_t {
-    uint16_t list[16]; /* expand? */
+    uint16_t list[PTLS_MAX_SIGNATURE_ALGORITHMS];
     size_t count;
 };
 
@@ -182,9 +182,16 @@ struct st_decoded_ech_config_t {
  * Properties for ECH. Iff ECH is used and not rejected, `aead` is non-NULL.
  */
 struct st_ptls_ech_t {
-    uint8_t offered : 1;
-    uint8_t offered_grease : 1;
-    uint8_t accepted : 1;
+    /**
+     * ECH state for this connection. `OFFERED` and `ACCEPTED` are used on both client and server; `GREASE` is client-only (server
+     * cannot distinguish GREASE from a config mismatch, both are simply ECH that fails to decrypt).
+     */
+    enum en_ptls_ech_state_t {
+        PTLS_ECH_STATE_NONE = 0,
+        PTLS_ECH_STATE_OFFERED,
+        PTLS_ECH_STATE_ACCEPTED,
+        PTLS_ECH_STATE_GREASE
+    } state;
     uint8_t config_id;
     ptls_hpke_kem_t *kem;
     ptls_hpke_cipher_suite_t *cipher;
@@ -198,6 +205,11 @@ struct st_ptls_ech_t {
          * retains a copy of entire ECH extension so that it can be replayed in the 2nd CH when ECH is rejected via HRR
          */
         ptls_iovec_t first_ech;
+        /**
+         * retry_configs received in EncryptedExtensions; retained here so that `ptls_free` releases them unless they are moved to
+         * `properties->client.ech.retry_configs` upon returning PTLS_ALERT_ECH_REQUIRED
+         */
+        ptls_iovec_t retry_configs;
     } client;
 };
 
@@ -257,9 +269,13 @@ struct st_ptls_t {
      */
     char *negotiated_protocol;
     /**
-     * selected key-exchange
+     * offered or selected key-exchange, also retained for session tickets
      */
     ptls_key_exchange_algorithm_t *key_share;
+    /**
+     * group used for key exchange in this handshake (zero for PSK-only or imported connections)
+     */
+    uint16_t negotiated_group;
     /**
      * selected cipher-suite
      */
@@ -279,12 +295,34 @@ struct st_ptls_t {
      * ECH
      */
     struct st_ptls_ech_t ech;
+    /**
+     * KeyUpdate to be sent before the next application data record
+     */
+    enum en_ptls_pending_key_update_t {
+        /**
+         * nothing is pending
+         */
+        PTLS_PENDING_KEY_UPDATE_NONE = 0,
+        /**
+         * update the send key, as requested by `ptls_update_key(tls, 0)` or due to the record limit; sent as update_not_requested
+         */
+        PTLS_PENDING_KEY_UPDATE_SELF,
+        /**
+         * update the send key and request the peer to update its send key, as requested by `ptls_update_key(tls, 1)`; sent as
+         * update_requested
+         */
+        PTLS_PENDING_KEY_UPDATE_SELF_AND_PEER,
+        /**
+         * respond to update_requested sent by the peer; sent as update_not_requested (RFC 9846 Section 4.7.3). This takes
+         * precedence over the other two, as the response updates the send key, and requesting the peer to update its send key is
+         * moot when the peer has just done so.
+         */
+        PTLS_PENDING_KEY_UPDATE_RESPONSE
+    } pending_key_update;
     /* flags */
     unsigned is_server : 1;
     unsigned is_psk_handshake : 1;
     unsigned send_change_cipher_spec : 1;
-    unsigned needs_key_update : 1;
-    unsigned key_update_send_request : 1;
 #if PTLS_HAVE_LOG
     /**
      * see ptls_log
@@ -367,7 +405,6 @@ struct st_ptls_client_hello_t {
         size_t count;
     } cert_compression_algos;
     struct {
-        ptls_iovec_t all;
         ptls_iovec_t tbs;
         ptls_iovec_t ch1_hash;
         ptls_iovec_t signature;
@@ -399,6 +436,7 @@ struct st_ptls_client_hello_t {
             size_t count;
         } identities;
         unsigned ke_modes;
+        unsigned ke_modes_present : 1;
         unsigned early_data_indication : 1;
         unsigned is_last_extension : 1;
     } psk;
@@ -887,7 +925,7 @@ static int commit_record_message(ptls_message_emitter_t *_self)
     do {                                                                                                                           \
         ptls_buffer_push16((buf), (type));                                                                                         \
         ptls_buffer_push_block((buf), 2, block);                                                                                   \
-    } while (0);
+    } while (0)
 
 #define decode_open_extensions(src, end, hstype, exttype, block)                                                                   \
     do {                                                                                                                           \
@@ -1005,6 +1043,8 @@ static void clear_ech(struct st_ptls_ech_t *ech, int is_server)
         }
         free(ech->client.first_ech.base);
         ech->client.first_ech = ptls_iovec_init(NULL, 0);
+        free(ech->client.retry_configs.base);
+        ech->client.retry_configs = ptls_iovec_init(NULL, 0);
     }
 }
 
@@ -1172,6 +1212,7 @@ static int client_setup_ech(struct st_ptls_ech_t *ech, struct st_decoded_ech_con
 Exit:
     if (ret != 0)
         clear_ech(ech, 0);
+    ptls_buffer_dispose(&infobuf);
     return ret;
 }
 
@@ -1199,7 +1240,8 @@ static void client_setup_ech_grease(struct st_ptls_ech_t *ech, void (*random_byt
 
     /* aead is generated from random */
     random_bytes(random_secret, sizeof(random_secret));
-    ech->aead = ptls_aead_new_direct(ech->cipher->aead, 1, random_secret, random_secret + PTLS_AES128_KEY_SIZE);
+    if ((ech->aead = ptls_aead_new_direct(ech->cipher->aead, 1, random_secret, random_secret + PTLS_AES128_KEY_SIZE)) == NULL)
+        goto Fail;
 
     /* `enc` is random bytes */
     if ((ech->client.enc.base = malloc(x25519_key_size)) == NULL)
@@ -1304,8 +1346,11 @@ static ptls_key_schedule_t *key_schedule_new(ptls_cipher_suite_t *preferred, ptl
         if ((sched->hashes[sched->num_hashes].ctx = cs->hash->create()) == NULL)
             goto Fail;
         if (use_outer) {
-            if ((sched->hashes[sched->num_hashes].ctx_outer = cs->hash->create()) == NULL)
+            if ((sched->hashes[sched->num_hashes].ctx_outer = cs->hash->create()) == NULL) {
+                /* num_hashes is yet to be incremented, therefore `ctx` has to be freed here */
+                sched->hashes[sched->num_hashes].ctx->final(sched->hashes[sched->num_hashes].ctx, NULL, PTLS_HASH_FINAL_MODE_FREE);
                 goto Fail;
+            }
         } else {
             sched->hashes[sched->num_hashes].ctx_outer = NULL;
         }
@@ -1341,7 +1386,7 @@ static int key_schedule_extract(ptls_key_schedule_t *sched, ptls_iovec_t ikm)
     return ret;
 }
 
-static int key_schedule_select_cipher(ptls_key_schedule_t *sched, ptls_cipher_suite_t *cs, int reset, ptls_iovec_t reset_ikm)
+static int key_schedule_select_cipher(ptls_key_schedule_t *sched, ptls_cipher_suite_t *cs, int reset, const ptls_iovec_t *reset_ikm)
 {
     size_t found_slot = SIZE_MAX, i;
     int ret;
@@ -1359,6 +1404,7 @@ static int key_schedule_select_cipher(ptls_key_schedule_t *sched, ptls_cipher_su
                 sched->hashes[i].ctx_outer->final(sched->hashes[i].ctx_outer, NULL, PTLS_HASH_FINAL_MODE_FREE);
         }
     }
+    assert(found_slot != SIZE_MAX);
     if (found_slot != 0) {
         sched->hashes[0] = sched->hashes[found_slot];
         reset = 1;
@@ -1367,9 +1413,10 @@ static int key_schedule_select_cipher(ptls_key_schedule_t *sched, ptls_cipher_su
 
     /* recalculate the hash if a different hash as been selected than the one we used for calculating the early secrets */
     if (reset) {
+        assert(reset_ikm != NULL);
         --sched->generation;
         memset(sched->secret, 0, sizeof(sched->secret));
-        if ((ret = key_schedule_extract(sched, reset_ikm)) != 0)
+        if ((ret = key_schedule_extract(sched, *reset_ikm)) != 0)
             goto Exit;
     }
 
@@ -1510,7 +1557,7 @@ Exit:
 }
 
 static int decode_new_session_ticket(ptls_t *tls, uint32_t *lifetime, uint32_t *age_add, ptls_iovec_t *nonce, ptls_iovec_t *ticket,
-                                     uint32_t *max_early_data_size, const uint8_t *src, const uint8_t *const end)
+                                     int *early_data, uint32_t *max_early_data_size, const uint8_t *src, const uint8_t *const end)
 {
     uint16_t exttype;
     int ret;
@@ -1532,14 +1579,16 @@ static int decode_new_session_ticket(ptls_t *tls, uint32_t *lifetime, uint32_t *
         src = end;
     });
 
+    *early_data = 0;
     *max_early_data_size = 0;
     decode_extensions(src, end, PTLS_HANDSHAKE_TYPE_NEW_SESSION_TICKET, &exttype, {
         if (tls->ctx->on_extension != NULL &&
             (ret = tls->ctx->on_extension->cb(tls->ctx->on_extension, tls, PTLS_HANDSHAKE_TYPE_NEW_SESSION_TICKET, exttype,
-                                              ptls_iovec_init(src, end - src)) != 0))
+                                              ptls_iovec_init(src, end - src))) != 0)
             goto Exit;
         switch (exttype) {
         case PTLS_EXTENSION_TYPE_EARLY_DATA:
+            *early_data = 1;
             if ((ret = ptls_decode32(max_early_data_size, &src, end)) != 0)
                 goto Exit;
             break;
@@ -1562,6 +1611,7 @@ static int decode_stored_session_ticket(ptls_t *tls, ptls_key_exchange_algorithm
     uint32_t lifetime, age_add;
     uint64_t obtained_at, now;
     ptls_iovec_t nonce;
+    int early_data;
     int ret;
 
     /* decode */
@@ -1572,7 +1622,8 @@ static int decode_stored_session_ticket(ptls_t *tls, ptls_key_exchange_algorithm
     if ((ret = ptls_decode16(&csid, &src, end)) != 0)
         goto Exit;
     ptls_decode_open_block(src, end, 3, {
-        if ((ret = decode_new_session_ticket(tls, &lifetime, &age_add, &nonce, ticket, max_early_data_size, src, end)) != 0)
+        if ((ret = decode_new_session_ticket(tls, &lifetime, &age_add, &nonce, ticket, &early_data, max_early_data_size, src,
+                                             end)) != 0)
             goto Exit;
         src = end;
     });
@@ -1845,7 +1896,7 @@ static int verify_finished(ptls_t *tls, ptls_iovec_t message)
     if ((ret = calc_verify_data(verify_data, tls->key_schedule, tls->traffic_protection.dec.secret)) != 0)
         goto Exit;
     if (!ptls_mem_equal(message.base + PTLS_HANDSHAKE_HEADER_SIZE, verify_data, tls->key_schedule->hashes[0].algo->digest_size)) {
-        ret = PTLS_ALERT_HANDSHAKE_FAILURE;
+        ret = PTLS_ALERT_DECRYPT_ERROR;
         goto Exit;
     }
 
@@ -1871,7 +1922,7 @@ Exit:
     return ret;
 }
 
-static int send_session_ticket(ptls_t *tls, ptls_message_emitter_t *emitter)
+static int send_session_ticket(ptls_t *tls, ptls_message_emitter_t *emitter, uint8_t ticket_nonce)
 {
     ptls_hash_context_t *msghash_backup = tls->key_schedule->hashes[0].ctx->clone_(tls->key_schedule->hashes[0].ctx);
     ptls_buffer_t session_id;
@@ -1881,6 +1932,9 @@ static int send_session_ticket(ptls_t *tls, ptls_message_emitter_t *emitter)
 
     assert(tls->ctx->ticket_lifetime != 0);
     assert(tls->ctx->encrypt_ticket != NULL);
+
+    if (msghash_backup == NULL)
+        return PTLS_ERROR_NO_MEMORY;
 
     ptls_buffer_init(&session_id, session_id_smallbuf, sizeof(session_id_smallbuf));
 
@@ -1906,16 +1960,17 @@ static int send_session_ticket(ptls_t *tls, ptls_message_emitter_t *emitter)
     tls->ctx->random_bytes(&ticket_age_add, sizeof(ticket_age_add));
 
     /* build the raw nsk */
-    if (tls->key_share != NULL && (ret = encode_session_identifier(tls->ctx, &session_id, ticket_age_add, ptls_iovec_init(NULL, 0),
-                                                                   tls->key_schedule, tls->server_name, tls->key_share->id,
-                                                                   tls->cipher_suite->id, tls->negotiated_protocol)) != 0)
+    if (tls->key_share != NULL &&
+        (ret = encode_session_identifier(tls->ctx, &session_id, ticket_age_add,
+                                         ptls_iovec_init(&ticket_nonce, sizeof(ticket_nonce)), tls->key_schedule, tls->server_name,
+                                         tls->key_share->id, tls->cipher_suite->id, tls->negotiated_protocol)) != 0)
         goto Exit;
 
     /* encrypt and send */
     ptls_push_message(emitter, tls->key_schedule, PTLS_HANDSHAKE_TYPE_NEW_SESSION_TICKET, {
         ptls_buffer_push32(emitter->buf, tls->ctx->ticket_lifetime);
         ptls_buffer_push32(emitter->buf, ticket_age_add);
-        ptls_buffer_push_block(emitter->buf, 1, {});
+        ptls_buffer_push_block(emitter->buf, 1, { ptls_buffer_pushv(emitter->buf, &ticket_nonce, sizeof(ticket_nonce)); });
         ptls_buffer_push_block(emitter->buf, 2, {
             if ((ret = tls->ctx->encrypt_ticket->cb(tls->ctx->encrypt_ticket, tls, 1, emitter->buf,
                                                     ptls_iovec_init(session_id.base, session_id.off))) != 0)
@@ -1978,15 +2033,21 @@ Exit:
     return ret;
 }
 
-static int push_signature_algorithms(ptls_verify_certificate_t *vc, ptls_buffer_t *sendbuf)
+static const uint16_t *get_signature_algorithms(ptls_verify_certificate_t *vc)
 {
     /* The list sent when verify callback is not registered */
-    static const uint16_t default_algos[] = {PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256, PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256,
+    static const uint16_t default_algos[] = {PTLS_SIGNATURE_RSA_PSS_RSAE_SHA384, PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,
+                                             PTLS_SIGNATURE_ECDSA_SECP384R1_SHA384, PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256,
                                              PTLS_SIGNATURE_RSA_PKCS1_SHA256, PTLS_SIGNATURE_RSA_PKCS1_SHA1, UINT16_MAX};
+    return vc != NULL ? vc->algos : default_algos;
+}
+
+static int push_signature_algorithms(ptls_verify_certificate_t *vc, ptls_buffer_t *sendbuf)
+{
     int ret;
 
     ptls_buffer_push_block(sendbuf, 2, {
-        for (const uint16_t *p = vc != NULL ? vc->algos : default_algos; *p != UINT16_MAX; ++p)
+        for (const uint16_t *p = get_signature_algorithms(vc); *p != UINT16_MAX; ++p)
             ptls_buffer_push16(sendbuf, *p);
     });
 
@@ -2085,7 +2146,7 @@ Exit:
     return ret;
 }
 
-static int select_key_share(ptls_key_exchange_algorithm_t **selected, ptls_iovec_t *peer_key,
+static int select_key_share(ptls_key_exchange_algorithm_t **selected, ptls_iovec_t *peer_key, int *post_quantum_offered,
                             ptls_key_exchange_algorithm_t **candidates, const uint8_t **src, const uint8_t *const end,
                             int expect_one)
 {
@@ -2105,9 +2166,13 @@ static int select_key_share(ptls_key_exchange_algorithm_t **selected, ptls_iovec
             goto Exit;
         ptls_key_exchange_algorithm_t **c = candidates;
         for (; *c != NULL; ++c) {
-            if (*selected == NULL && (*c)->id == group) {
-                *selected = *c;
-                *peer_key = key;
+            if ((*c)->id == group) {
+                if (*selected == NULL) {
+                    *selected = *c;
+                    *peer_key = key;
+                }
+                if ((*c)->post_quantum)
+                    *post_quantum_offered = 1;
             }
         }
         if (expect_one) {
@@ -2209,18 +2274,21 @@ static int encode_client_hello(ptls_context_t *ctx, ptls_buffer_t *sendbuf, enum
                 buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_ENCRYPTED_CLIENT_HELLO,
                                       { ptls_buffer_pushv(sendbuf, ech_replay.base, ech_replay.len); });
             }
-            if (mode == ENCODE_CH_MODE_ENCODED_INNER) {
-                buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_ECH_OUTER_EXTENSIONS, {
-                    ptls_buffer_push_block(sendbuf, 1, { ptls_buffer_push16(sendbuf, PTLS_EXTENSION_TYPE_KEY_SHARE); });
-                });
-            } else {
-                buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_KEY_SHARE, {
-                    ptls_buffer_push_block(sendbuf, 2, {
-                        if (key_share_ctx != NULL &&
-                            (ret = push_key_share_entry(sendbuf, key_share_ctx->algo->id, key_share_ctx->pubkey)) != 0)
-                            goto Exit;
+            /* key_share is sent along with supported_groups (RFC 9846 Section 9.2) */
+            if (ctx->key_exchanges != NULL) {
+                if (mode == ENCODE_CH_MODE_ENCODED_INNER) {
+                    buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_ECH_OUTER_EXTENSIONS, {
+                        ptls_buffer_push_block(sendbuf, 1, { ptls_buffer_push16(sendbuf, PTLS_EXTENSION_TYPE_KEY_SHARE); });
                     });
-                });
+                } else {
+                    buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_KEY_SHARE, {
+                        ptls_buffer_push_block(sendbuf, 2, {
+                            if (key_share_ctx != NULL &&
+                                (ret = push_key_share_entry(sendbuf, key_share_ctx->algo->id, key_share_ctx->pubkey)) != 0)
+                                goto Exit;
+                        });
+                    });
+                }
             }
             if (sni_name != NULL) {
                 buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_SERVER_NAME, {
@@ -2306,7 +2374,7 @@ static int encode_client_hello(ptls_context_t *ctx, ptls_buffer_t *sendbuf, enum
                 buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_PRE_SHARED_KEY, {
                     ptls_buffer_push_block(sendbuf, 2, {
                         ptls_buffer_push_block(sendbuf, 2, {
-                            if (mode == ENCODE_CH_MODE_OUTER) {
+                            if (mode == ENCODE_CH_MODE_OUTER && ech->state != PTLS_ECH_STATE_GREASE) {
                                 if ((ret = ptls_buffer_reserve(sendbuf, psk_identity.len)) != 0)
                                     goto Exit;
                                 ctx->random_bytes(sendbuf->base + sendbuf->off, psk_identity.len);
@@ -2316,7 +2384,7 @@ static int encode_client_hello(ptls_context_t *ctx, ptls_buffer_t *sendbuf, enum
                             }
                         });
                         uint32_t age;
-                        if (mode == ENCODE_CH_MODE_OUTER) {
+                        if (mode == ENCODE_CH_MODE_OUTER && ech->state != PTLS_ECH_STATE_GREASE) {
                             ctx->random_bytes(&age, sizeof(age));
                         } else {
                             age = obfuscated_ticket_age;
@@ -2342,6 +2410,28 @@ Exit:
     return ret;
 }
 
+/**
+ * Feeds the CH message into the hash, computing the PSK binder if necessary. `binder_key` must be derived before calling this
+ * function.
+ */
+static int update_ch_hash_and_binder(ptls_key_schedule_t *ks, uint8_t *ch, size_t ch_start, size_t ch_end, int has_psk,
+                                     uint8_t *binder_key, int is_outer)
+{
+    int ret = 0;
+    size_t hash_off = ch_start;
+
+    if (has_psk) {
+        size_t psk_binder_off = ch_end - (3 + ks->hashes[0].algo->digest_size);
+        ptls__key_schedule_update_hash(ks, ch + hash_off, psk_binder_off - hash_off, is_outer);
+        hash_off = psk_binder_off;
+        if ((ret = calc_verify_data(ch + psk_binder_off + 3, ks, binder_key)) != 0)
+            return ret;
+    }
+    ptls__key_schedule_update_hash(ks, ch + hash_off, ch_end - hash_off, is_outer);
+
+    return ret;
+}
+
 static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_handshake_properties_t *properties,
                              ptls_iovec_t *cookie)
 {
@@ -2352,7 +2442,7 @@ static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_
     } psk = {{NULL}};
     uint32_t obfuscated_ticket_age = 0;
     const char *sni_name = NULL;
-    size_t mess_start, msghash_off;
+    size_t mess_start;
     uint8_t binder_key[PTLS_MAX_DIGEST_SIZE];
     ptls_buffer_t encoded_ch_inner;
     int ret, is_second_flight = tls->key_schedule != NULL;
@@ -2372,10 +2462,11 @@ static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_
                     if ((ret = client_setup_ech(&tls->ech, &decoded, tls->ctx->random_bytes)) != 0)
                         goto Exit;
                 }
-            } else {
-                /* zero-length config indicates ECH greasing */
+            } else if (properties->client.ech.configs.base != NULL) {
+                /* zero-length config with non-NULL base indicates ECH greasing; NULL base means no ECH */
                 client_setup_ech_grease(&tls->ech, tls->ctx->random_bytes, tls->ctx->ech.client.kems, tls->ctx->ech.client.ciphers,
                                         sni_name);
+                tls->ech.state = PTLS_ECH_STATE_GREASE;
             }
         }
     }
@@ -2411,19 +2502,21 @@ static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_
         uint32_t max_early_data_size;
         if (decode_stored_session_ticket(tls, &key_share, &cipher_suite, &psk.secret, &obfuscated_ticket_age, &psk.identity,
                                          &max_early_data_size, properties->client.session_ticket.base,
-                                         properties->client.session_ticket.base + properties->client.session_ticket.len) == 0) {
+                                         properties->client.session_ticket.base + properties->client.session_ticket.len) == 0 &&
+            (!is_second_flight || cipher_suite->hash == tls->cipher_suite->hash)) {
             psk.label = "res binder";
             tls->client.offered_psk = 1;
-            /* key-share selected by HRR should not be overridden */
-            if (tls->key_share == NULL)
+            if (!is_second_flight) {
                 tls->key_share = key_share;
-            tls->cipher_suite = cipher_suite;
-            if (!is_second_flight && max_early_data_size != 0 && properties->client.max_early_data_size != NULL) {
-                tls->client.using_early_data = 1;
-                *properties->client.max_early_data_size = max_early_data_size;
+                tls->cipher_suite = cipher_suite;
+                if (max_early_data_size != 0 && properties->client.max_early_data_size != NULL) {
+                    tls->client.using_early_data = 1;
+                    *properties->client.max_early_data_size = max_early_data_size;
+                }
             }
         } else {
             psk.secret = ptls_iovec_init(NULL, 0);
+            tls->client.offered_psk = 0; /* ticket offered in 1st CH is dropped in the 2nd CH, HRR adopted a different hash */
         }
     }
 
@@ -2463,7 +2556,7 @@ static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_
     /* start generating CH */
     if ((ret = emitter->begin_message(emitter)) != 0)
         goto Exit;
-    mess_start = msghash_off = emitter->buf->off;
+    mess_start = emitter->buf->off;
 
     /* generate true (inner) CH */
     if ((ret = encode_client_hello(tls->ctx, emitter->buf, ENCODE_CH_MODE_INNER, is_second_flight, properties,
@@ -2475,15 +2568,12 @@ static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_
 
     /* update the message hash, filling in the PSK binder HMAC if necessary */
     if (psk.secret.base != NULL) {
-        size_t psk_binder_off = emitter->buf->off - (3 + tls->key_schedule->hashes[0].algo->digest_size);
         if ((ret = derive_secret_with_empty_digest(tls->key_schedule, binder_key, psk.label)) != 0)
             goto Exit;
-        ptls__key_schedule_update_hash(tls->key_schedule, emitter->buf->base + msghash_off, psk_binder_off - msghash_off, 0);
-        msghash_off = psk_binder_off;
-        if ((ret = calc_verify_data(emitter->buf->base + psk_binder_off + 3, tls->key_schedule, binder_key)) != 0)
-            goto Exit;
     }
-    ptls__key_schedule_update_hash(tls->key_schedule, emitter->buf->base + msghash_off, emitter->buf->off - msghash_off, 0);
+    if ((ret = update_ch_hash_and_binder(tls->key_schedule, emitter->buf->base, mess_start, emitter->buf->off,
+                                         psk.secret.base != NULL, binder_key, 0)) != 0)
+        goto Exit;
 
     /* ECH */
     if (tls->ech.aead != NULL) {
@@ -2501,9 +2591,8 @@ static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_
         { /* pad EncodedCHInner (following draft-ietf-tls-esni-15 6.1.3) */
             size_t padding_len;
             if (sni_name != NULL) {
-                padding_len = strlen(sni_name);
-                if (padding_len < tls->ech.client.max_name_length)
-                    padding_len = tls->ech.client.max_name_length;
+                size_t sni_len = strlen(sni_name);
+                padding_len = sni_len < tls->ech.client.max_name_length ? tls->ech.client.max_name_length - sni_len : 0;
             } else {
                 padding_len = tls->ech.client.max_name_length + 9;
             }
@@ -2542,14 +2631,26 @@ static int send_client_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_
             memcpy(tls->ech.client.first_ech.base,
                    emitter->buf->base + ech_size_offset - outer_ech_header_size(tls->ech.client.enc.len), len);
             tls->ech.client.first_ech.len = len;
-            if (properties != NULL && properties->client.ech.configs.len != 0) {
-                tls->ech.offered = 1;
-            } else {
-                tls->ech.offered_grease = 1;
-            }
+            if (tls->ech.state != PTLS_ECH_STATE_GREASE)
+                tls->ech.state = PTLS_ECH_STATE_OFFERED;
         }
-        /* update hash */
-        ptls__key_schedule_update_hash(tls->key_schedule, emitter->buf->base + mess_start, emitter->buf->off - mess_start, 1);
+        if (tls->ech.state == PTLS_ECH_STATE_GREASE) {
+            /* For grease ECH, the server sees the outer CH. Discard the inner state and adopt the outer, then compute the PSK
+             * binder over the outer CH using the standard flow. */
+            for (size_t i = 0; i < tls->key_schedule->num_hashes; ++i) {
+                tls->key_schedule->hashes[i].ctx->final(tls->key_schedule->hashes[i].ctx, NULL, PTLS_HASH_FINAL_MODE_FREE);
+                tls->key_schedule->hashes[i].ctx = tls->key_schedule->hashes[i].ctx_outer;
+                tls->key_schedule->hashes[i].ctx_outer = NULL;
+            }
+            ptls_aead_free(tls->ech.aead);
+            tls->ech.aead = NULL;
+            if ((ret = update_ch_hash_and_binder(tls->key_schedule, emitter->buf->base, mess_start, emitter->buf->off,
+                                                     psk.secret.base != NULL, binder_key, 0)) != 0)
+                goto Exit;
+        } else {
+            /* update outer hash */
+            ptls__key_schedule_update_hash(tls->key_schedule, emitter->buf->base + mess_start, emitter->buf->off - mess_start, 1);
+        }
     }
 
     /* commit CH to the record layer */
@@ -2592,12 +2693,16 @@ static int decode_server_hello(ptls_t *tls, struct st_ptls_server_hello_t *sh, c
 
     *sh = (struct st_ptls_server_hello_t){{0}};
 
-    /* ignore legacy-version */
-    if (end - src < 2) {
-        ret = PTLS_ALERT_DECODE_ERROR;
-        goto Exit;
+    { /* legacy_version (RFC 9846 section 4.2.3: "A client which receives a TLS 1.3 Server Hello with a legacy_version value not
+       * equal to 0x0303 MUST abort the handshake with a "protocol_version" alert."; we do not support older versions either) */
+        uint16_t legacy_version;
+        if ((ret = ptls_decode16(&legacy_version, &src, end)) != 0)
+            goto Exit;
+        if (legacy_version != 0x0303) {
+            ret = PTLS_ALERT_PROTOCOL_VERSION;
+            goto Exit;
+        }
     }
-    src += 2;
 
     /* random */
     if (end - src < PTLS_HELLO_RANDOM_SIZE) {
@@ -2606,6 +2711,10 @@ static int decode_server_hello(ptls_t *tls, struct st_ptls_server_hello_t *sh, c
     }
     sh->is_retry_request = memcmp(src, hello_retry_random, PTLS_HELLO_RANDOM_SIZE) == 0;
     src += PTLS_HELLO_RANDOM_SIZE;
+    if (sh->is_retry_request && tls->state == PTLS_STATE_CLIENT_EXPECT_SECOND_SERVER_HELLO) {
+        ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
+        goto Exit;
+    }
 
     /* legacy_session_id */
     ptls_decode_open_block(src, end, 1, {
@@ -2621,9 +2730,17 @@ static int decode_server_hello(ptls_t *tls, struct st_ptls_server_hello_t *sh, c
         uint16_t csid;
         if ((ret = ptls_decode16(&csid, &src, end)) != 0)
             goto Exit;
-        if ((tls->cipher_suite = ptls_find_cipher_suite(tls->ctx->cipher_suites, csid)) == NULL) {
-            ret = PTLS_ALERT_ILLEGAL_PARAMETER;
-            goto Exit;
+        if (tls->state == PTLS_STATE_CLIENT_EXPECT_SERVER_HELLO) {
+            if ((tls->cipher_suite = ptls_find_cipher_suite(tls->ctx->cipher_suites, csid)) == NULL) {
+                ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+                goto Exit;
+            }
+        } else {
+            assert(tls->state == PTLS_STATE_CLIENT_EXPECT_SECOND_SERVER_HELLO);
+            if (tls->cipher_suite->id != csid) {
+                ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+                goto Exit;
+            }
         }
     }
 
@@ -2645,7 +2762,7 @@ static int decode_server_hello(ptls_t *tls, struct st_ptls_server_hello_t *sh, c
                       {
                           if (tls->ctx->on_extension != NULL &&
                               (ret = tls->ctx->on_extension->cb(tls->ctx->on_extension, tls, PTLS_HANDSHAKE_TYPE_SERVER_HELLO,
-                                                                exttype, ptls_iovec_init(src, end - src)) != 0))
+                                                                exttype, ptls_iovec_init(src, end - src))) != 0)
                               goto Exit;
                           switch (exttype) {
                           case PTLS_EXTENSION_TYPE_SUPPORTED_VERSIONS:
@@ -2660,6 +2777,12 @@ static int decode_server_hello(ptls_t *tls, struct st_ptls_server_hello_t *sh, c
                               if (sh->is_retry_request) {
                                   if ((ret = ptls_decode16(&sh->retry_request.selected_group, &src, end)) != 0)
                                       goto Exit;
+                                  /* UINT16_MAX is used as the marker of key_share being absent, and it is not a group that we
+                                   * offer */
+                                  if (sh->retry_request.selected_group == UINT16_MAX) {
+                                      ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+                                      goto Exit;
+                                  }
                               } else {
                                   uint16_t group;
                                   if ((ret = decode_key_share_entry(&group, &sh->peerkey, &src, end)) != 0)
@@ -2692,7 +2815,7 @@ static int decode_server_hello(ptls_t *tls, struct st_ptls_server_hello_t *sh, c
                               break;
                           case PTLS_EXTENSION_TYPE_ENCRYPTED_CLIENT_HELLO:
                               assert(sh->is_retry_request);
-                              if (!(tls->ech.offered || tls->ech.offered_grease)) {
+                              if (tls->ech.state == PTLS_ECH_STATE_NONE) {
                                   ret = PTLS_ALERT_UNSUPPORTED_EXTENSION;
                                   goto Exit;
                               }
@@ -2725,10 +2848,19 @@ static int decode_server_hello(ptls_t *tls, struct st_ptls_server_hello_t *sh, c
             }
             tls->is_psk_handshake = 1;
         }
-        if (sh->peerkey.base == NULL && !tls->is_psk_handshake) {
+        if (sh->peerkey.base == NULL && !(tls->is_psk_handshake && !tls->ctx->require_dhe_on_psk)) {
             ret = PTLS_ALERT_ILLEGAL_PARAMETER;
             goto Exit;
         }
+    }
+    /* The hash of the selected cipher-suite must match that of the PSK (RFC 8446 section 4.2.11), which is the hash that the
+     * ClientHello was built with (i.e., `hashes[0]`). The check applies when the PSK is selected by ServerHello, as well as when
+     * HRR is received while offering an external PSK, because the external PSK (unlike a resumption PSK) is going to be offered
+     * again by the second ClientHello. */
+    if ((tls->is_psk_handshake || (sh->is_retry_request && tls->ctx->pre_shared_key.identity.base != NULL)) &&
+        tls->cipher_suite->hash != tls->key_schedule->hashes[0].algo) {
+        ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+        goto Exit;
     }
 
     ret = 0;
@@ -2766,9 +2898,23 @@ static int handle_hello_retry_request(ptls_t *tls, ptls_message_emitter_t *emitt
             ret = PTLS_ALERT_ILLEGAL_PARAMETER;
             goto Exit;
         }
+        if (tls->key_share != NULL && sh->retry_request.selected_group == tls->key_share->id) {
+            ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+            goto Exit;
+        }
         tls->key_share = *cand;
     } else if (tls->key_share != NULL) {
-        /* retain the key-share using in first CH, if server does not specify one */
+        /* Retain the key-share used in the first CH, if the server does not specify one. But then, the HRR has to carry a cookie,
+         * as RFC 9846 Section 4.2.4 requires the client to abort if the HRR would not result in any change in the CH. Checking the
+         * two is sufficient, because HRR can carry only the extensions offered by the client, except for cookie (Section 4.2.4),
+         * and among them, key_share and cookie are the only ones that change CH: supported_versions and encrypted_client_hello do
+         * not, and those supplied by the application cannot, as the second CH is built from the same `properties` without the
+         * application being given a chance to modify them. This check has to be revised when support for another HRR extension
+         * that changes CH is added, or when the application becomes able to change CH in response to HRR. */
+        if (sh->retry_request.cookie.base == NULL) {
+            ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+            goto Exit;
+        }
     } else {
         ret = PTLS_ALERT_ILLEGAL_PARAMETER;
         goto Exit;
@@ -2793,10 +2939,16 @@ static int client_ech_select_hello(ptls_t *tls, ptls_iovec_t message, size_t con
         if ((ret = ech_calc_confirmation(tls->key_schedule, confirm_hash_expected, tls->ech.inner_client_random, label, message)) !=
             0)
             goto Exit;
-        tls->ech.accepted = ptls_mem_equal(confirm_hash_delivered, confirm_hash_expected, sizeof(confirm_hash_delivered));
+        int accepted = ptls_mem_equal(confirm_hash_delivered, confirm_hash_expected, sizeof(confirm_hash_delivered));
         memcpy(message.base + confirm_hash_off, confirm_hash_delivered, sizeof(confirm_hash_delivered));
-        if (tls->ech.accepted)
+        if (accepted) {
+            tls->ech.state = PTLS_ECH_STATE_ACCEPTED;
             goto Exit;
+        } else if (tls->ech.state == PTLS_ECH_STATE_ACCEPTED) {
+            /* Per RFC 9849 Section 6.1.5: if HRR confirmed ECH acceptance, ServerHello MUST also confirm it. */
+            ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+            goto Exit;
+        }
     }
 
     /* dispose ECH AEAD state to indicate rejection, adopting outer CH for the rest of the handshake */
@@ -2805,8 +2957,8 @@ static int client_ech_select_hello(ptls_t *tls, ptls_iovec_t message, size_t con
     key_schedule_select_outer(tls->key_schedule);
 
 Exit:
-    PTLS_PROBE(ECH_SELECTION, tls, !!tls->ech.accepted);
-    PTLS_LOG_CONN(ech_selection, tls, { PTLS_LOG_ELEMENT_BOOL(is_ech, tls->ech.accepted); });
+    PTLS_PROBE(ECH_SELECTION, tls, tls->ech.state == PTLS_ECH_STATE_ACCEPTED);
+    PTLS_LOG_CONN(ech_selection, tls, { PTLS_LOG_ELEMENT_BOOL(is_ech, tls->ech.state == PTLS_ECH_STATE_ACCEPTED); });
     ptls_clear_memory(confirm_hash_expected, sizeof(confirm_hash_expected));
     return ret;
 }
@@ -2827,16 +2979,14 @@ static int client_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
     }
 
     if (sh.is_retry_request) {
-        if ((ret = key_schedule_select_cipher(tls->key_schedule, tls->cipher_suite, 0, tls->ctx->pre_shared_key.secret)) != 0)
+        if ((ret = key_schedule_select_cipher(tls->key_schedule, tls->cipher_suite, 0, &tls->ctx->pre_shared_key.secret)) != 0)
             goto Exit;
         key_schedule_transform_post_ch1hash(tls->key_schedule);
         if (tls->ech.aead != NULL) {
             size_t confirm_hash_off = 0;
-            if (tls->ech.offered) {
+            if (tls->ech.state != PTLS_ECH_STATE_GREASE) {
                 if (sh.retry_request.ech != NULL)
                     confirm_hash_off = sh.retry_request.ech - message.base;
-            } else {
-                assert(tls->ech.offered_grease);
             }
             if ((ret = client_ech_select_hello(tls, message, confirm_hash_off, ECH_CONFIRMATION_HRR)) != 0)
                 goto Exit;
@@ -2845,21 +2995,27 @@ static int client_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
         return handle_hello_retry_request(tls, emitter, &sh, message, properties);
     }
 
-    if ((ret = key_schedule_select_cipher(tls->key_schedule, tls->cipher_suite, tls->client.offered_psk && !tls->is_psk_handshake,
-                                          ptls_iovec_init(NULL, 0))) != 0)
+    static const ptls_iovec_t zero_ikm = {NULL, 0};
+    if ((ret = key_schedule_select_cipher(
+             tls->key_schedule, tls->cipher_suite, tls->client.offered_psk && !tls->is_psk_handshake,
+             tls->is_psk_handshake ? NULL /* if psk was selected, a reset must never happen */ : &zero_ikm)) != 0)
         goto Exit;
 
     /* check if ECH is accepted */
     if (tls->ech.aead != NULL) {
         size_t confirm_hash_off = 0;
-        if (tls->ech.offered) {
+        if (tls->ech.state != PTLS_ECH_STATE_GREASE) {
             confirm_hash_off =
                 PTLS_HANDSHAKE_HEADER_SIZE + 2 /* legacy_version */ + PTLS_HELLO_RANDOM_SIZE - PTLS_ECH_CONFIRM_LENGTH;
-        } else {
-            assert(tls->ech.offered_grease);
         }
         if ((ret = client_ech_select_hello(tls, message, confirm_hash_off, ECH_CONFIRMATION_SERVER_HELLO)) != 0)
             goto Exit;
+    }
+
+    /* if ECH was offered but rejected, PSK must not be used (RFC 9849 Section 6.1.2) */
+    if (tls->ech.state == PTLS_ECH_STATE_OFFERED && tls->is_psk_handshake) {
+        ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+        goto Exit;
     }
 
     /* clear sensitive and space-consuming ECH state, now that are done with handling sending and decoding Hellos */
@@ -2882,6 +3038,7 @@ static int client_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
             assert(ecdh_secret.base == NULL);
             goto Exit;
         }
+        tls->negotiated_group = tls->key_share->id;
     }
 
     if ((ret = key_schedule_extract(tls->key_schedule, ecdh_secret)) != 0)
@@ -2958,7 +3115,7 @@ static int client_handle_encrypted_extensions(ptls_t *tls, ptls_iovec_t message,
     decode_extensions(src, end, PTLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, &type, {
         if (tls->ctx->on_extension != NULL &&
             (ret = tls->ctx->on_extension->cb(tls->ctx->on_extension, tls, PTLS_HANDSHAKE_TYPE_ENCRYPTED_EXTENSIONS, type,
-                                              ptls_iovec_init(src, end - src)) != 0))
+                                              ptls_iovec_init(src, end - src))) != 0)
             goto Exit;
         switch (type) {
         case PTLS_EXTENSION_TYPE_SERVER_NAME:
@@ -2989,7 +3146,7 @@ static int client_handle_encrypted_extensions(ptls_t *tls, ptls_iovec_t message,
             });
             break;
         case PTLS_EXTENSION_TYPE_EARLY_DATA:
-            if (!tls->client.using_early_data) {
+            if (!(tls->client.using_early_data && tls->is_psk_handshake)) {
                 ret = PTLS_ALERT_ILLEGAL_PARAMETER;
                 goto Exit;
             }
@@ -3004,23 +3161,25 @@ static int client_handle_encrypted_extensions(ptls_t *tls, ptls_iovec_t message,
             src = end;
             break;
         case PTLS_EXTENSION_TYPE_ENCRYPTED_CLIENT_HELLO: {
-            /* accept retry_configs only if we offered ECH but rejected */
-            if (!((tls->ech.offered || tls->ech.offered_grease) && !ptls_is_ech_handshake(tls, NULL, NULL, NULL))) {
+            /* accept retry_configs only if we offered ECH (or grease) but rejected */
+            if (!(tls->ech.state == PTLS_ECH_STATE_OFFERED || tls->ech.state == PTLS_ECH_STATE_GREASE)) {
                 ret = PTLS_ALERT_UNSUPPORTED_EXTENSION;
                 goto Exit;
             }
-            /* parse retry_config, and if it is applicable, provide that to the application */
+            /* parse retry_config, and if it is applicable, provide that to the application (grease clients just verify syntax) */
             struct st_decoded_ech_config_t decoded;
             if ((ret = client_decode_ech_config_list(tls->ctx, &decoded, ptls_iovec_init(src, end - src))) != 0)
                 goto Exit;
-            if (decoded.kem != NULL && decoded.cipher != NULL && properties != NULL &&
-                properties->client.ech.retry_configs != NULL) {
-                if ((properties->client.ech.retry_configs->base = malloc(end - src)) == NULL) {
+            if (tls->ech.state == PTLS_ECH_STATE_GREASE) {
+                /* GREASE clients ignore retry_configs after verifying the syntax */
+            } else if (decoded.kem != NULL && decoded.cipher != NULL && properties != NULL &&
+                       properties->client.ech.retry_configs != NULL) {
+                if ((tls->ech.client.retry_configs.base = malloc(end - src)) == NULL) {
                     ret = PTLS_ERROR_NO_MEMORY;
                     goto Exit;
                 }
-                memcpy(properties->client.ech.retry_configs->base, src, end - src);
-                properties->client.ech.retry_configs->len = end - src;
+                memcpy(tls->ech.client.retry_configs.base, src, end - src);
+                tls->ech.client.retry_configs.len = end - src;
             }
             src = end;
         } break;
@@ -3093,7 +3252,7 @@ static int decode_certificate_request(ptls_t *tls, struct st_ptls_certificate_re
     decode_extensions(src, end, PTLS_HANDSHAKE_TYPE_CERTIFICATE_REQUEST, &exttype, {
         if (tls->ctx->on_extension != NULL &&
             (ret = tls->ctx->on_extension->cb(tls->ctx->on_extension, tls, PTLS_HANDSHAKE_TYPE_CERTIFICATE_REQUEST, exttype,
-                                              ptls_iovec_init(src, end - src)) != 0))
+                                              ptls_iovec_init(src, end - src))) != 0)
             goto Exit;
         switch (exttype) {
         case PTLS_EXTENSION_TYPE_SIGNATURE_ALGORITHMS:
@@ -3264,15 +3423,18 @@ static int handle_certificate(ptls_t *tls, const uint8_t *src, const uint8_t *en
     ptls_decode_block(src, end, 3, {
         while (src != end) {
             ptls_decode_open_block(src, end, 3, {
-                if (num_certs < PTLS_ELEMENTSOF(certs))
-                    certs[num_certs++] = ptls_iovec_init(src, end - src);
+                if (num_certs == PTLS_ELEMENTSOF(certs)) {
+                    ret = PTLS_ALERT_BAD_CERTIFICATE;
+                    goto Exit;
+                }
+                certs[num_certs++] = ptls_iovec_init(src, end - src);
                 src = end;
             });
             uint16_t type;
             decode_open_extensions(src, end, PTLS_HANDSHAKE_TYPE_CERTIFICATE, &type, {
                 if (tls->ctx->on_extension != NULL &&
                     (ret = tls->ctx->on_extension->cb(tls->ctx->on_extension, tls, PTLS_HANDSHAKE_TYPE_CERTIFICATE, type,
-                                                      ptls_iovec_init(src, end - src)) != 0))
+                                                      ptls_iovec_init(src, end - src))) != 0)
                     goto Exit;
                 src = end;
             });
@@ -3282,7 +3444,7 @@ static int handle_certificate(ptls_t *tls, const uint8_t *src, const uint8_t *en
     if (tls->ctx->verify_certificate != NULL) {
         const char *server_name = NULL;
         if (!ptls_is_server(tls)) {
-            if (tls->ech.offered && !ptls_is_ech_handshake(tls, NULL, NULL, NULL)) {
+            if (tls->ech.state == PTLS_ECH_STATE_OFFERED) {
                 server_name = tls->ech.client.public_name;
             } else {
                 server_name = tls->server_name;
@@ -3407,6 +3569,14 @@ static int handle_certificate_verify(ptls_t *tls, ptls_iovec_t message, const ch
         src = end;
     });
 
+    /* The peer must use a signature algorithm that we advertised. */
+    for (const uint16_t *p = get_signature_algorithms(tls->ctx->verify_certificate); *p != UINT16_MAX; ++p)
+        if (*p == algo)
+            goto AlgorithmFound;
+    ret = PTLS_ALERT_ILLEGAL_PARAMETER;
+    goto Exit;
+
+AlgorithmFound:
     signdata_size = build_certificate_verify_signdata(signdata, tls->key_schedule, context_string);
     if (tls->certificate_verify.cb != NULL) {
         ret = tls->certificate_verify.cb(tls->certificate_verify.verify_ctx, algo, ptls_iovec_init(signdata, signdata_size),
@@ -3450,10 +3620,11 @@ static int server_handle_certificate_verify(ptls_t *tls, ptls_iovec_t message)
     return ret;
 }
 
-static int client_handle_finished(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_iovec_t message)
+static int client_handle_finished(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_iovec_t message,
+                                  ptls_handshake_properties_t *properties)
 {
     uint8_t send_secret[PTLS_MAX_DIGEST_SIZE];
-    int alert_ech_required = tls->ech.offered && !ptls_is_ech_handshake(tls, NULL, NULL, NULL), ret;
+    int alert_ech_required = tls->ech.state == PTLS_ECH_STATE_OFFERED, ret;
 
     if ((ret = verify_finished(tls, message)) != 0)
         goto Exit;
@@ -3493,7 +3664,8 @@ static int client_handle_finished(ptls_t *tls, ptls_message_emitter_t *emitter, 
             goto Exit;
     }
 
-    ret = send_finished(tls, emitter);
+    if ((ret = send_finished(tls, emitter)) != 0)
+        goto Exit;
 
     memcpy(tls->traffic_protection.enc.secret, send_secret, sizeof(send_secret));
     if ((ret = setup_traffic_protection(tls, 1, NULL, 3, 0, 0)) != 0)
@@ -3501,9 +3673,15 @@ static int client_handle_finished(ptls_t *tls, ptls_message_emitter_t *emitter, 
 
     tls->state = PTLS_STATE_CLIENT_POST_HANDSHAKE;
 
-    /* if ECH was rejected, close the connection with ECH_REQUIRED alert after verifying messages up to Finished */
-    if (alert_ech_required)
+    /* If ECH was rejected, close the connection with ECH_REQUIRED alert after verifying messages up to Finished, handing over
+     * retry_configs along with the alert. */
+    if (alert_ech_required) {
+        if (tls->ech.client.retry_configs.base != NULL && properties != NULL && properties->client.ech.retry_configs != NULL) {
+            *properties->client.ech.retry_configs = tls->ech.client.retry_configs;
+            tls->ech.client.retry_configs = ptls_iovec_init(NULL, 0);
+        }
         ret = PTLS_ALERT_ECH_REQUIRED;
+    }
 
 Exit:
     ptls_clear_memory(send_secret, sizeof(send_secret));
@@ -3514,18 +3692,21 @@ static int client_handle_new_session_ticket(ptls_t *tls, ptls_iovec_t message)
 {
     const uint8_t *src = message.base + PTLS_HANDSHAKE_HEADER_SIZE, *const end = message.base + message.len;
     ptls_iovec_t ticket_nonce;
+    uint32_t ticket_lifetime, max_early_data_size;
+    int early_data;
     int ret;
 
     { /* verify the format */
-        uint32_t ticket_lifetime, ticket_age_add, max_early_data_size;
+        uint32_t ticket_age_add;
         ptls_iovec_t ticket;
-        if ((ret = decode_new_session_ticket(tls, &ticket_lifetime, &ticket_age_add, &ticket_nonce, &ticket, &max_early_data_size,
-                                             src, end)) != 0)
+        if ((ret = decode_new_session_ticket(tls, &ticket_lifetime, &ticket_age_add, &ticket_nonce, &ticket, &early_data,
+                                             &max_early_data_size, src, end)) != 0)
             return ret;
     }
 
-    /* do nothing if use of session ticket is disabled */
-    if (tls->ctx->save_ticket == NULL)
+    /* do nothing if use of session ticket is disabled, or if there is no key share to be recorded (i.e., external PSK being used
+     * without key exchanges; such a ticket cannot be used for resumption) */
+    if (tls->ctx->save_ticket == NULL || tls->key_share == NULL)
         return 0;
 
     /* save the extension, along with the key of myself */
@@ -3543,7 +3724,10 @@ static int client_handle_new_session_ticket(ptls_t *tls, ptls_iovec_t message)
         ticket_buf.off += tls->key_schedule->hashes[0].algo->digest_size;
     });
 
-    if ((ret = tls->ctx->save_ticket->cb(tls->ctx->save_ticket, tls, ptls_iovec_init(ticket_buf.base, ticket_buf.off))) != 0)
+    ptls_save_ticket_properties_t properties = {
+        .lifetime = ticket_lifetime, .early_data = early_data, .max_early_data_size = max_early_data_size};
+    if ((ret = tls->ctx->save_ticket->cb(tls->ctx->save_ticket, tls, ptls_iovec_init(ticket_buf.base, ticket_buf.off),
+                                         &properties)) != 0)
         goto Exit;
 
     ret = 0;
@@ -3564,6 +3748,10 @@ static int client_hello_decode_server_name(ptls_iovec_t *name, const uint8_t **s
             ptls_decode_open_block(*src, end, 2, {
                 switch (type) {
                 case PTLS_SERVER_NAME_TYPE_HOSTNAME:
+                    if (end - *src == 0) {
+                        ret = PTLS_ALERT_DECODE_ERROR;
+                        goto Exit;
+                    }
                     if (memchr(*src, '\0', end - *src) != 0) {
                         ret = PTLS_ALERT_ILLEGAL_PARAMETER;
                         goto Exit;
@@ -3583,9 +3771,14 @@ Exit:
 }
 
 static int select_negotiated_group(ptls_key_exchange_algorithm_t **selected, ptls_key_exchange_algorithm_t **candidates,
-                                   const uint8_t *src, const uint8_t *const end)
+                                   const uint8_t *src, const uint8_t *const end, int post_quantum_only)
 {
     int ret;
+
+    if (src == NULL) {
+        ret = PTLS_ALERT_MISSING_EXTENSION;
+        goto Exit;
+    }
 
     ptls_decode_block(src, end, 2, {
         while (src != end) {
@@ -3594,7 +3787,7 @@ static int select_negotiated_group(ptls_key_exchange_algorithm_t **selected, ptl
                 goto Exit;
             ptls_key_exchange_algorithm_t **c = candidates;
             for (; *c != NULL; ++c) {
-                if ((*c)->id == group) {
+                if ((*c)->id == group && (!post_quantum_only || (*c)->post_quantum)) {
                     *selected = *c;
                     return 0;
                 }
@@ -3676,7 +3869,7 @@ static int decode_client_hello(ptls_context_t *ctx, struct st_ptls_client_hello_
         ch->psk.is_last_extension = 0;
         if (ctx->on_extension != NULL && tls_cbarg != NULL &&
             (ret = ctx->on_extension->cb(ctx->on_extension, tls_cbarg, PTLS_HANDSHAKE_TYPE_CLIENT_HELLO, exttype,
-                                         ptls_iovec_init(src, end - src)) != 0))
+                                         ptls_iovec_init(src, end - src))) != 0)
             goto Exit;
         switch (exttype) {
         case PTLS_EXTENSION_TYPE_SERVER_NAME:
@@ -3733,6 +3926,13 @@ static int decode_client_hello(ptls_context_t *ctx, struct st_ptls_client_hello_
             break;
         case PTLS_EXTENSION_TYPE_SUPPORTED_GROUPS:
             ch->negotiated_groups = ptls_iovec_init(src, end - src);
+            ptls_decode_block(src, end, 2, {
+                if (!(end - src >= 2 && (end - src) % 2 == 0)) {
+                    ret = PTLS_ALERT_DECODE_ERROR;
+                    goto Exit;
+                }
+                src = end;
+            });
             break;
         case PTLS_EXTENSION_TYPE_SIGNATURE_ALGORITHMS:
             if ((ret = decode_signature_algorithms(&ch->signature_algorithms, &src, end)) != 0)
@@ -3761,38 +3961,42 @@ static int decode_client_hello(ptls_context_t *ctx, struct st_ptls_client_hello_
             });
             break;
         case PTLS_EXTENSION_TYPE_COOKIE:
-            if (properties == NULL || properties->server.cookie.key == NULL) {
-                ret = PTLS_ALERT_ILLEGAL_PARAMETER;
-                goto Exit;
-            }
-            ch->cookie.all = ptls_iovec_init(src, end - src);
             ptls_decode_block(src, end, 2, {
-                ch->cookie.tbs.base = (void *)src;
-                ptls_decode_open_block(src, end, 2, {
-                    ptls_decode_open_block(src, end, 1, {
-                        ch->cookie.ch1_hash = ptls_iovec_init(src, end - src);
-                        src = end;
-                    });
-                    uint8_t sent_key_share;
-                    if ((ret = ptls_decode8(&sent_key_share, &src, end)) != 0)
-                        goto Exit;
-                    switch (sent_key_share) {
-                    case 0:
-                        assert(!ch->cookie.sent_key_share);
-                        break;
-                    case 1:
-                        ch->cookie.sent_key_share = 1;
-                        break;
-                    default:
-                        ret = PTLS_ALERT_DECODE_ERROR;
+                if (end - src == 1) {
+                    /* cookie of a stateful HRR, being a single byte that carries no information */
+                    src = end;
+                } else {
+                    if (properties == NULL || properties->server.cookie.key == NULL) {
+                        ret = PTLS_ALERT_ILLEGAL_PARAMETER;
                         goto Exit;
                     }
-                });
-                ch->cookie.tbs.len = src - ch->cookie.tbs.base;
-                ptls_decode_block(src, end, 1, {
-                    ch->cookie.signature = ptls_iovec_init(src, end - src);
-                    src = end;
-                });
+                    ch->cookie.tbs.base = (void *)src;
+                    ptls_decode_open_block(src, end, 2, {
+                        ptls_decode_open_block(src, end, 1, {
+                            ch->cookie.ch1_hash = ptls_iovec_init(src, end - src);
+                            src = end;
+                        });
+                        uint8_t sent_key_share;
+                        if ((ret = ptls_decode8(&sent_key_share, &src, end)) != 0)
+                            goto Exit;
+                        switch (sent_key_share) {
+                        case 0:
+                            assert(!ch->cookie.sent_key_share);
+                            break;
+                        case 1:
+                            ch->cookie.sent_key_share = 1;
+                            break;
+                        default:
+                            ret = PTLS_ALERT_DECODE_ERROR;
+                            goto Exit;
+                        }
+                    });
+                    ch->cookie.tbs.len = src - ch->cookie.tbs.base;
+                    ptls_decode_block(src, end, 1, {
+                        ch->cookie.signature = ptls_iovec_init(src, end - src);
+                        src = end;
+                    });
+                }
             });
             break;
         case PTLS_EXTENSION_TYPE_PRE_SHARED_KEY: {
@@ -3834,6 +4038,7 @@ static int decode_client_hello(ptls_context_t *ctx, struct st_ptls_client_hello_
             ch->psk.is_last_extension = 1;
         } break;
         case PTLS_EXTENSION_TYPE_PSK_KEY_EXCHANGE_MODES:
+            ch->psk.ke_modes_present = 1;
             ptls_decode_block(src, end, 1, {
                 do {
                     uint8_t mode;
@@ -4089,10 +4294,22 @@ static int check_client_hello_constraints(ptls_context_t *ctx, struct st_ptls_cl
         /* PSK must be the last extension */
         if (!ch->psk.is_last_extension)
             return PTLS_ALERT_ILLEGAL_PARAMETER;
+        /* RFC 9846 Section 4.3.9: "If clients offer "pre_shared_key" without a "psk_key_exchange_modes" extension, servers MUST
+         * abort the handshake." */
+        if (!ch->psk.ke_modes_present)
+            return PTLS_ALERT_MISSING_EXTENSION;
     } else {
         if (ch->psk.early_data_indication)
             return PTLS_ALERT_ILLEGAL_PARAMETER;
     }
+
+    /* Section 9.2 of RFC 9846 requires ClientHello to meet the following requirements:
+     * - If not containing a "pre_shared_key" extension, it MUST contain both a "signature_algorithms" extension and a
+     *   "supported_groups" extension (absence of "signature_algorithms" is detected when sending a certificate).
+     * - If containing a "supported_groups" extension, it MUST also contain a "key_share" extension, and vice versa. */
+    if ((ch->psk.hash_end == NULL && ch->negotiated_groups.base == NULL) ||
+        (ch->negotiated_groups.base != NULL) != (ch->key_shares.base != NULL))
+        return PTLS_ALERT_MISSING_EXTENSION;
 
     if (ech_is_inner_ch && ch->ech.payload.base == NULL)
         return PTLS_ALERT_ILLEGAL_PARAMETER;
@@ -4205,6 +4422,8 @@ static int try_psk_handshake(ptls_t *tls, size_t *psk_index, int *accept_early_d
                 continue;
             if (!vec_is_string(ticket_negotiated_protocol, tls->negotiated_protocol))
                 continue;
+        } else if (tls->negotiated_protocol != NULL) {
+            continue;
         }
         /* check the length of the decrypted psk and the PSK binder */
         if (secret.len != tls->key_schedule->hashes[0].algo->digest_size)
@@ -4233,7 +4452,8 @@ Found:
     if ((ret = calc_verify_data(binder_key /* to conserve space, reuse binder_key for storing verify_data */, tls->key_schedule,
                                 binder_key)) != 0)
         goto Exit;
-    if (!ptls_mem_equal(ch->psk.identities.list[*psk_index].binder.base, binder_key,
+    if (ch->psk.identities.list[*psk_index].binder.len != tls->key_schedule->hashes[0].algo->digest_size ||
+        !ptls_mem_equal(ch->psk.identities.list[*psk_index].binder.base, binder_key,
                         tls->key_schedule->hashes[0].algo->digest_size)) {
         ret = PTLS_ALERT_DECRYPT_ERROR;
         goto Exit;
@@ -4347,6 +4567,7 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
     struct {
         ptls_key_exchange_algorithm_t *algorithm;
         ptls_iovec_t peer_key;
+        int post_quantum_offered;
     } key_share = {NULL};
     struct {
         uint8_t *encoded_ch_inner;
@@ -4398,9 +4619,9 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
             goto Exit;
         }
         if (!is_second_flight)
-            tls->ech.offered = 1;
+            tls->ech.state = PTLS_ECH_STATE_OFFERED;
         /* obtain AEAD context for opening inner CH */
-        if (!is_second_flight && ch->ech.payload.base != NULL && tls->ctx->ech.server.create_opener != NULL) {
+        if (!is_second_flight && tls->ctx->ech.server.create_opener != NULL) {
             if ((tls->ech.aead = tls->ctx->ech.server.create_opener->cb(
                      tls->ctx->ech.server.create_opener, &tls->ech.kem, &tls->ech.cipher, tls, ch->ech.config_id,
                      ch->ech.cipher_suite, ch->ech.enc, ptls_iovec_init(ech_info_prefix, sizeof(ech_info_prefix)))) != NULL)
@@ -4412,6 +4633,10 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
         }
         if (tls->ech.aead != NULL) {
             /* now that AEAD context is available, create AAD and decrypt inner CH */
+            if (ch->ech.payload.len <= tls->ech.aead->algo->tag_size) {
+                ret = PTLS_ALERT_DECODE_ERROR;
+                goto Exit;
+            }
             if ((ech.encoded_ch_inner = malloc(ch->ech.payload.len - tls->ech.aead->algo->tag_size)) == NULL ||
                 (ech.ch_outer_aad = malloc(message.len - PTLS_HANDSHAKE_HEADER_SIZE)) == NULL) {
                 ret = PTLS_ERROR_NO_MEMORY;
@@ -4421,7 +4646,7 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
             memset(ech.ch_outer_aad + (ch->ech.payload.base - (message.base + PTLS_HANDSHAKE_HEADER_SIZE)), 0, ch->ech.payload.len);
             if (ptls_aead_decrypt(tls->ech.aead, ech.encoded_ch_inner, ch->ech.payload.base, ch->ech.payload.len, is_second_flight,
                                   ech.ch_outer_aad, message.len - PTLS_HANDSHAKE_HEADER_SIZE) != SIZE_MAX) {
-                tls->ech.accepted = 1;
+                tls->ech.state = PTLS_ECH_STATE_ACCEPTED;
                 /* successfully decrypted EncodedCHInner, build CHInner */
                 if ((ret = rebuild_ch_inner(&ech.ch_inner, ech.encoded_ch_inner,
                                             ech.encoded_ch_inner + ch->ech.payload.len - tls->ech.aead->algo->tag_size, ch,
@@ -4449,7 +4674,7 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
                 tls->ech.aead = NULL;
             }
         }
-    } else if (tls->ech.offered) {
+    } else if (tls->ech.state != PTLS_ECH_STATE_NONE) {
         assert(is_second_flight);
         ret = PTLS_ALERT_ILLEGAL_PARAMETER;
         goto Exit;
@@ -4514,17 +4739,18 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
     }
 
     /* select key_share */
-    if (key_share.algorithm == NULL && ch->key_shares.base != NULL && tls->ctx->key_exchanges != NULL) {
+    if (ch->key_shares.base != NULL && tls->ctx->key_exchanges != NULL) {
         const uint8_t *src = ch->key_shares.base, *const end = src + ch->key_shares.len;
         ptls_decode_block(src, end, 2, {
-            if ((ret = select_key_share(&key_share.algorithm, &key_share.peer_key, tls->ctx->key_exchanges, &src, end, 0)) != 0)
+            if ((ret = select_key_share(&key_share.algorithm, &key_share.peer_key, &key_share.post_quantum_offered,
+                                        tls->ctx->key_exchanges, &src, end, 0)) != 0)
                 goto Exit;
         });
     }
 
     if (!is_second_flight) {
-        if (ch->cookie.all.len != 0 && key_share.algorithm != NULL) {
-
+        ptls_key_exchange_algorithm_t *negotiated_group = NULL;
+        if (ch->cookie.tbs.base != NULL && key_share.algorithm != NULL) {
             { /* use cookie to check the integrity of the handshake, and update the context */
                 uint8_t sig[PTLS_MAX_DIGEST_SIZE];
                 size_t sigsize = tls->ctx->cipher_suites[0]->hash->digest_size;
@@ -4538,32 +4764,49 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
             /* integrity check passed; update states */
             key_schedule_update_ch1hash_prefix(tls->key_schedule);
             ptls__key_schedule_update_hash(tls->key_schedule, ch->cookie.ch1_hash.base, ch->cookie.ch1_hash.len, 0);
-            key_schedule_extract(tls->key_schedule,
-                                 tls->ctx->pre_shared_key.secret /* this argument will be a zero-length vector unless external PSK
-                                                                  is used, and that's fine; we never resume when sending HRR */);
+            if ((ret = key_schedule_extract(tls->key_schedule,
+                                            tls->ctx->pre_shared_key.secret /* this argument will be a zero-length vector unless
+                                                                             external PSK is used, and that's fine; we never resume
+                                                                             when sending HRR */)) != 0)
+                goto Exit;
             /* ... reusing sendbuf to rebuild HRR for hash calculation */
             size_t hrr_start = emitter->buf->off;
             EMIT_HELLO_RETRY_REQUEST(tls->key_schedule, ch->cookie.sent_key_share ? key_share.algorithm : NULL,
                                      {
                                          buffer_push_extension(emitter->buf, PTLS_EXTENSION_TYPE_COOKIE, {
-                                             ptls_buffer_pushv(emitter->buf, ch->cookie.all.base, ch->cookie.all.len);
+                                             ptls_buffer_push_block(emitter->buf, 2, {
+                                                 ptls_buffer_pushv(emitter->buf, ch->cookie.tbs.base, ch->cookie.tbs.len);
+                                                 ptls_buffer_push_block(emitter->buf, 1, {
+                                                     ptls_buffer_pushv(emitter->buf, ch->cookie.signature.base,
+                                                                       ch->cookie.signature.len);
+                                                 });
+                                             });
                                          });
                                      },
                                      {});
             emitter->buf->off = hrr_start;
             is_second_flight = 1;
-
-        } else if (ch->key_shares.base != NULL && tls->ctx->key_exchanges != NULL &&
-                   (key_share.algorithm == NULL || (properties != NULL && properties->server.enforce_retry))) {
-            /* send HelloRetryRequest, when trying to negotiate the key share but enforced by config or upon key-share mismatch */
-            if (ch->negotiated_groups.base == NULL) {
-                ret = PTLS_ALERT_MISSING_EXTENSION;
+            /* early data is not permitted after HRR (RFC 9846 Section 4.3.10); same check as the stateful path above */
+            if (ch->psk.early_data_indication) {
+                ret = PTLS_ALERT_DECODE_ERROR;
                 goto Exit;
             }
-            ptls_key_exchange_algorithm_t *negotiated_group;
-            if ((ret = select_negotiated_group(&negotiated_group, tls->ctx->key_exchanges, ch->negotiated_groups.base,
-                                               ch->negotiated_groups.base + ch->negotiated_groups.len)) != 0)
-                goto Exit;
+
+        } else if (ch->key_shares.base != NULL && tls->ctx->key_exchanges != NULL &&
+                   (key_share.algorithm == NULL || (properties != NULL && properties->server.enforce_retry) ||
+                    (!key_share.post_quantum_offered &&
+                     (ret = select_negotiated_group(&negotiated_group, tls->ctx->key_exchanges, ch->negotiated_groups.base,
+                                                    ch->negotiated_groups.base + ch->negotiated_groups.len, 1)) == 0))) {
+            /* send HelloRetryRequest upon either:
+             * - key-share mismatch
+             * - enforced by config
+             * - both peers support PQ but the offered key-share was non-PQ. */
+            if (key_share.algorithm == NULL) {
+                assert(negotiated_group == NULL);
+                if ((ret = select_negotiated_group(&negotiated_group, tls->ctx->key_exchanges, ch->negotiated_groups.base,
+                                                   ch->negotiated_groups.base + ch->negotiated_groups.len, 0)) != 0)
+                    goto Exit;
+            }
             ptls__key_schedule_update_hash(tls->key_schedule, message.base, message.len, 0);
             assert(tls->key_schedule->generation == 0);
 
@@ -4573,11 +4816,12 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
                 properties != NULL && properties->server.retry_uses_cookie && !ptls_is_ech_handshake(tls, NULL, NULL, NULL);
             if (!retry_uses_cookie) {
                 key_schedule_transform_post_ch1hash(tls->key_schedule);
-                key_schedule_extract(tls->key_schedule, tls->ctx->pre_shared_key.secret /* see comment above */);
+                if ((ret = key_schedule_extract(tls->key_schedule, tls->ctx->pre_shared_key.secret /* see comment above */)) != 0)
+                    goto Exit;
             }
             size_t ech_confirm_off = 0;
             EMIT_HELLO_RETRY_REQUEST(
-                tls->key_schedule, key_share.algorithm != NULL ? NULL : negotiated_group,
+                tls->key_schedule, negotiated_group,
                 {
                     ptls_buffer_t *sendbuf = emitter->buf;
                     if (ptls_is_ech_handshake(tls, NULL, NULL, NULL)) {
@@ -4588,6 +4832,13 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
                             ech_confirm_off = sendbuf->off;
                             sendbuf->off += PTLS_ECH_CONFIRM_LENGTH;
                         });
+                    }
+                    if (!retry_uses_cookie && negotiated_group == NULL) {
+                        /* An HRR that does not change the CH is a protocol violation (RFC 9846 Section 4.2.4). Therefore, when
+                         * sending a stateful HRR without a key_share (i.e., due to `enforce_retry`), include a cookie, which the
+                         * client is required to echo. As the server is stateful, the value can be a constant. */
+                        buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_COOKIE,
+                                              { ptls_buffer_push_block(sendbuf, 2, { ptls_buffer_push(sendbuf, 0); }); });
                     }
                     if (retry_uses_cookie) {
                         buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_COOKIE, {
@@ -4604,7 +4855,7 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
                                         sendbuf->off += sz;
                                     });
                                     /* second is if we have sent key_share extension */
-                                    ptls_buffer_push(sendbuf, key_share.algorithm == NULL);
+                                    ptls_buffer_push(sendbuf, negotiated_group != NULL);
                                     /* we can add more data here */
                                 });
                                 size_t tbs_len = sendbuf->off - tbs_start;
@@ -4613,9 +4864,10 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
                                     size_t sz = tls->ctx->cipher_suites[0]->hash->digest_size;
                                     if ((ret = ptls_buffer_reserve(sendbuf, sz)) != 0)
                                         goto Exit;
-                                    if ((ret = calc_cookie_signature(tls, properties, negotiated_group,
-                                                                     ptls_iovec_init(sendbuf->base + tbs_start, tbs_len),
-                                                                     sendbuf->base + sendbuf->off)) != 0)
+                                    if ((ret = calc_cookie_signature(
+                                             tls, properties, negotiated_group != NULL ? negotiated_group : key_share.algorithm,
+                                             ptls_iovec_init(sendbuf->base + tbs_start, tbs_len), sendbuf->base + sendbuf->off)) !=
+                                        0)
                                         goto Exit;
                                     sendbuf->off += sz;
                                 });
@@ -4631,9 +4883,9 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
                              ptls_iovec_init(emitter->buf->base + sh_start_off, emitter->buf->off - sh_start_off))) != 0)
                         goto Exit;
                 });
+            if ((ret = push_change_cipher_spec(tls, emitter)) != 0)
+                goto Exit;
             if (retry_uses_cookie) {
-                if ((ret = push_change_cipher_spec(tls, emitter)) != 0)
-                    goto Exit;
                 ret = PTLS_ERROR_STATELESS_RETRY;
             } else {
                 tls->state = PTLS_STATE_SERVER_EXPECT_SECOND_CLIENT_HELLO;
@@ -4676,7 +4928,8 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
         ptls__key_schedule_update_hash(tls->key_schedule, message.base, message.len, 0);
         if (!is_second_flight) {
             assert(tls->key_schedule->generation == 0);
-            key_schedule_extract(tls->key_schedule, ptls_iovec_init(NULL, 0));
+            if ((ret = key_schedule_extract(tls->key_schedule, ptls_iovec_init(NULL, 0))) != 0)
+                goto Exit;
         }
         mode = HANDSHAKE_MODE_FULL;
         if (properties != NULL)
@@ -4692,13 +4945,14 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
         tls->is_psk_handshake = 1;
         if (properties != NULL) {
             ptls_iovec_t *selected = &ch->psk.identities.list[psk_index].binder;
+            assert(selected->len <= sizeof(properties->server.selected_psk_binder.base));
             memcpy(properties->server.selected_psk_binder.base, selected->base, selected->len);
             properties->server.selected_psk_binder.len = selected->len;
         }
     }
 
-    /* determine number of tickets to send */
-    if (ch->psk.ke_modes != 0 && tls->ctx->ticket_lifetime != 0) {
+    /* determine number of tickets to send; none when client authentication is required, as resumption is refused */
+    if (ch->psk.ke_modes != 0 && tls->ctx->ticket_lifetime != 0 && !tls->ctx->require_client_authentication) {
         if (ch->ticket_request.new_session_count != 0) {
             tls->server.num_tickets_to_send =
                 tls->is_psk_handshake ? ch->ticket_request.resumption_count : ch->ticket_request.new_session_count;
@@ -4737,6 +4991,7 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
             goto Exit;
         }
         tls->key_share = key_share.algorithm;
+        tls->negotiated_group = key_share.algorithm->id;
     }
 
     { /* send ServerHello */
@@ -4782,7 +5037,8 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
 
     /* create protection contexts for the handshake */
     assert(tls->key_schedule->generation == 1);
-    key_schedule_extract(tls->key_schedule, ecdh_secret);
+    if ((ret = key_schedule_extract(tls->key_schedule, ecdh_secret)) != 0)
+        goto Exit;
     if ((ret = setup_traffic_protection(tls, 1, "s hs traffic", 2, 0, 0)) != 0)
         goto Exit;
     if (tls->pending_handshake_secret != NULL) {
@@ -4823,7 +5079,7 @@ static int server_handle_hello(ptls_t *tls, ptls_message_emitter_t *emitter, ptl
             if (tls->pending_handshake_secret != NULL)
                 buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_EARLY_DATA, {});
             /* send ECH retry_configs, if ECH was offered by rejected, even though we (the server) could have accepted ECH */
-            if (tls->ech.offered && !ptls_is_ech_handshake(tls, NULL, NULL, NULL) && tls->ctx->ech.server.create_opener != NULL &&
+            if (tls->ech.state == PTLS_ECH_STATE_OFFERED && tls->ctx->ech.server.create_opener != NULL &&
                 tls->ctx->ech.server.retry_configs.len != 0)
                 buffer_push_extension(sendbuf, PTLS_EXTENSION_TYPE_ENCRYPTED_CLIENT_HELLO, {
                     ptls_buffer_pushv(sendbuf, tls->ctx->ech.server.retry_configs.base, tls->ctx->ech.server.retry_configs.len);
@@ -4946,7 +5202,7 @@ static int server_finish_handshake(ptls_t *tls, ptls_message_emitter_t *emitter,
     if (tls->server.num_tickets_to_send != 0) {
         assert(tls->ctx->ticket_lifetime != 0);
         for (uint8_t i = 0; i < tls->server.num_tickets_to_send; ++i)
-            if ((ret = send_session_ticket(tls, emitter)) != 0)
+            if ((ret = send_session_ticket(tls, emitter, i)) != 0)
                 goto Exit;
     }
 
@@ -5003,7 +5259,7 @@ static int update_traffic_key(ptls_t *tls, int is_enc)
     if ((ret = ptls_hkdf_expand_label(hash, secret, hash->digest_size, ptls_iovec_init(tp->secret, hash->digest_size),
                                       "traffic upd", ptls_iovec_init(NULL, 0), NULL)) != 0)
         goto Exit;
-    memcpy(tp->secret, secret, sizeof(secret));
+    memcpy(tp->secret, secret, hash->digest_size);
     ret = setup_traffic_protection(tls, is_enc, NULL, 3, 0, 1);
 
 Exit:
@@ -5013,22 +5269,26 @@ Exit:
 
 static int handle_key_update(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_iovec_t message)
 {
-    const uint8_t *src = message.base + PTLS_HANDSHAKE_HEADER_SIZE, *const end = message.base + message.len;
     int ret;
 
+    /* KeyUpdate is not supported when the application owns the record layer. */
+    if (tls->ctx->update_traffic_key != NULL)
+        return PTLS_ALERT_UNEXPECTED_MESSAGE;
+
+    const uint8_t *src = message.base + PTLS_HANDSHAKE_HEADER_SIZE, *const end = message.base + message.len;
+
     /* validate */
-    if (end - src != 1 || *src > 1)
+    if (end - src != 1)
         return PTLS_ALERT_DECODE_ERROR;
+    if (*src > 1)
+        return PTLS_ALERT_ILLEGAL_PARAMETER;
 
     /* update receive key */
     if ((ret = update_traffic_key(tls, 0)) != 0)
         return ret;
 
-    if (*src) {
-        if (tls->ctx->update_traffic_key != NULL)
-            return PTLS_ALERT_UNEXPECTED_MESSAGE;
-        tls->needs_key_update = 1;
-    }
+    if (*src)
+        tls->pending_key_update = PTLS_PENDING_KEY_UPDATE_RESPONSE;
 
     return 0;
 }
@@ -5041,7 +5301,7 @@ static int parse_record_header(struct st_ptls_record_t *rec, const uint8_t *src)
 
     if (rec->length >
         (size_t)(rec->type == PTLS_CONTENT_TYPE_APPDATA ? PTLS_MAX_ENCRYPTED_RECORD_SIZE : PTLS_MAX_PLAINTEXT_RECORD_SIZE))
-        return PTLS_ALERT_DECODE_ERROR;
+        return PTLS_ALERT_RECORD_OVERFLOW;
 
     return 0;
 }
@@ -5159,7 +5419,7 @@ static ptls_t *new_instance(ptls_context_t *ctx, int is_server)
     if (ptls_log_conn_state_override != NULL) {
         tls->log_state = *ptls_log_conn_state_override;
     } else {
-        ptls_log_init_conn_state(&tls->log_state, ctx->random_bytes);
+        ptls_log_init_conn_state(&tls->log_state, ctx->random_bytes, 0, NULL);
     }
 #endif
 
@@ -5168,7 +5428,11 @@ static ptls_t *new_instance(ptls_context_t *ctx, int is_server)
 
 ptls_t *ptls_client_new(ptls_context_t *ctx)
 {
-    ptls_t *tls = new_instance(ctx, 0);
+    ptls_t *tls;
+
+    if ((tls = new_instance(ctx, 0)) == NULL)
+        return NULL;
+
     tls->state = PTLS_STATE_CLIENT_HANDSHAKE_START;
     tls->ctx->random_bytes(tls->client_random, sizeof(tls->client_random));
     log_client_random(tls);
@@ -5185,7 +5449,11 @@ ptls_t *ptls_client_new(ptls_context_t *ctx)
 
 ptls_t *ptls_server_new(ptls_context_t *ctx)
 {
-    ptls_t *tls = new_instance(ctx, 1);
+    ptls_t *tls;
+
+    if ((tls = new_instance(ctx, 1)) == NULL)
+        return NULL;
+
     tls->state = PTLS_STATE_SERVER_EXPECT_CLIENT_HELLO;
     tls->server.early_data_skipped_bytes = UINT32_MAX;
 
@@ -5290,6 +5558,11 @@ int ptls_export(ptls_t *tls, ptls_buffer_t *output)
         ret = PTLS_ERROR_LIBRARY;
         goto Exit;
     }
+    /* KeyUpdate that is yet to be sent is not exported */
+    if (tls->pending_key_update != PTLS_PENDING_KEY_UPDATE_NONE) {
+        ret = PTLS_ERROR_IN_PROGRESS;
+        goto Exit;
+    }
 
     if (ptls_get_protocol_version(tls) == PTLS_PROTOCOL_VERSION_TLS13) {
         export_tls_params(output, tls->is_server, tls->is_psk_handshake, PTLS_PROTOCOL_VERSION_TLS13, tls->cipher_suite,
@@ -5345,6 +5618,9 @@ static int import_tls13_traffic_protection(ptls_t *tls, int is_enc, const uint8_
 {
     struct st_ptls_traffic_protection_t *tp = is_enc ? &tls->traffic_protection.enc : &tls->traffic_protection.dec;
 
+    if ((size_t)(end - *src) < tls->cipher_suite->hash->digest_size)
+        return PTLS_ALERT_DECODE_ERROR;
+
     /* set properties */
     memcpy(tp->secret, *src, tls->cipher_suite->hash->digest_size);
     *src += tls->cipher_suite->hash->digest_size;
@@ -5376,6 +5652,8 @@ int ptls_import(ptls_context_t *ctx, ptls_t **tls, ptls_iovec_t params)
             ret = PTLS_ERROR_NO_MEMORY;
             goto Exit;
         }
+        if ((*tls)->is_server)
+            (*tls)->server.early_data_skipped_bytes = UINT32_MAX;
         (*tls)->is_psk_handshake = *src++;
         /* determine protocol version and cipher suite */
         if ((ret = ptls_decode16(&protocol_version, &src, end)) != 0)
@@ -5589,9 +5867,14 @@ int ptls_is_psk_handshake(ptls_t *tls)
     return tls->is_psk_handshake;
 }
 
+uint16_t ptls_get_negotiated_group(ptls_t *tls)
+{
+    return tls->negotiated_group;
+}
+
 int ptls_is_ech_handshake(ptls_t *tls, uint8_t *config_id, ptls_hpke_kem_t **kem, ptls_hpke_cipher_suite_t **cipher)
 {
-    if (tls->ech.accepted) {
+    if (tls->ech.state == PTLS_ECH_STATE_ACCEPTED) {
         if (config_id != NULL)
             *config_id = tls->ech.config_id;
         if (kem != NULL)
@@ -5667,7 +5950,7 @@ static int handle_client_handshake_message(ptls_t *tls, ptls_message_emitter_t *
         break;
     case PTLS_STATE_CLIENT_EXPECT_FINISHED:
         if (type == PTLS_HANDSHAKE_TYPE_FINISHED && is_end_of_record) {
-            ret = client_handle_finished(tls, emitter, message);
+            ret = client_handle_finished(tls, emitter, message, properties);
         } else {
             ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
         }
@@ -5678,7 +5961,11 @@ static int handle_client_handshake_message(ptls_t *tls, ptls_message_emitter_t *
             ret = client_handle_new_session_ticket(tls, message);
             break;
         case PTLS_HANDSHAKE_TYPE_KEY_UPDATE:
-            ret = handle_key_update(tls, emitter, message);
+            if (is_end_of_record) {
+                ret = handle_key_update(tls, emitter, message);
+            } else {
+                ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
+            }
             break;
         default:
             ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
@@ -5694,9 +5981,9 @@ static int handle_client_handshake_message(ptls_t *tls, ptls_message_emitter_t *
     PTLS_PROBE(RECEIVE_MESSAGE, tls, message.base[0], message.base + PTLS_HANDSHAKE_HEADER_SIZE,
                message.len - PTLS_HANDSHAKE_HEADER_SIZE, ret);
     PTLS_LOG_CONN(receive_message, tls, {
-        PTLS_LOG_ELEMENT_UNSIGNED(message, message.base[0]);
-        PTLS_LOG_ELEMENT_UNSIGNED(len, message.len - PTLS_HANDSHAKE_HEADER_SIZE);
-        PTLS_LOG_ELEMENT_SIGNED(result, ret);
+        PTLS_LOG_ELEMENT_NUMBER(message, message.base[0]);
+        PTLS_LOG_ELEMENT_NUMBER(len, message.len - PTLS_HANDSHAKE_HEADER_SIZE);
+        PTLS_LOG_ELEMENT_NUMBER(result, ret);
     });
 
     return ret;
@@ -5714,7 +6001,7 @@ static int handle_server_handshake_message(ptls_t *tls, ptls_message_emitter_t *
         if (type == PTLS_HANDSHAKE_TYPE_CLIENT_HELLO && is_end_of_record) {
             ret = server_handle_hello(tls, emitter, message, properties);
         } else {
-            ret = PTLS_ALERT_HANDSHAKE_FAILURE;
+            ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
         }
         break;
     case PTLS_STATE_SERVER_EXPECT_CERTIFICATE:
@@ -5733,7 +6020,7 @@ static int handle_server_handshake_message(ptls_t *tls, ptls_message_emitter_t *
         break;
     case PTLS_STATE_SERVER_EXPECT_END_OF_EARLY_DATA:
         assert(!tls->ctx->omit_end_of_early_data);
-        if (type == PTLS_HANDSHAKE_TYPE_END_OF_EARLY_DATA) {
+        if (type == PTLS_HANDSHAKE_TYPE_END_OF_EARLY_DATA && is_end_of_record) {
             ret = server_handle_end_of_early_data(tls, message);
         } else {
             ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
@@ -5743,13 +6030,17 @@ static int handle_server_handshake_message(ptls_t *tls, ptls_message_emitter_t *
         if (type == PTLS_HANDSHAKE_TYPE_FINISHED && is_end_of_record) {
             ret = server_handle_finished(tls, message);
         } else {
-            ret = PTLS_ALERT_HANDSHAKE_FAILURE;
+            ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
         }
         break;
     case PTLS_STATE_SERVER_POST_HANDSHAKE:
         switch (type) {
         case PTLS_HANDSHAKE_TYPE_KEY_UPDATE:
-            ret = handle_key_update(tls, emitter, message);
+            if (is_end_of_record) {
+                ret = handle_key_update(tls, emitter, message);
+            } else {
+                ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
+            }
             break;
         default:
             ret = PTLS_ALERT_UNEXPECTED_MESSAGE;
@@ -5765,9 +6056,9 @@ static int handle_server_handshake_message(ptls_t *tls, ptls_message_emitter_t *
     PTLS_PROBE(RECEIVE_MESSAGE, tls, message.base[0], message.base + PTLS_HANDSHAKE_HEADER_SIZE,
                message.len - PTLS_HANDSHAKE_HEADER_SIZE, ret);
     PTLS_LOG_CONN(receive_message, tls, {
-        PTLS_LOG_ELEMENT_UNSIGNED(message, message.base[0]);
-        PTLS_LOG_ELEMENT_UNSIGNED(len, message.len - PTLS_HANDSHAKE_HEADER_SIZE);
-        PTLS_LOG_ELEMENT_SIGNED(result, ret);
+        PTLS_LOG_ELEMENT_NUMBER(message, message.base[0]);
+        PTLS_LOG_ELEMENT_NUMBER(len, message.len - PTLS_HANDSHAKE_HEADER_SIZE);
+        PTLS_LOG_ELEMENT_NUMBER(result, ret);
     });
 
     return ret;
@@ -5878,14 +6169,20 @@ static int handle_input(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_buffe
     if (rec.type == PTLS_CONTENT_TYPE_CHANGE_CIPHER_SPEC) {
         if (tls->state < PTLS_STATE_POST_HANDSHAKE_MIN) {
             if (!(rec.length == 1 && rec.fragment[0] == 0x01))
-                return PTLS_ALERT_ILLEGAL_PARAMETER;
+                return PTLS_ALERT_UNEXPECTED_MESSAGE;
         } else {
-            return PTLS_ALERT_HANDSHAKE_FAILURE;
+            return PTLS_ALERT_UNEXPECTED_MESSAGE;
         }
         ret = PTLS_ERROR_IN_PROGRESS;
         goto NextRecord;
-    }
-    if (tls->traffic_protection.dec.aead != NULL && rec.type != PTLS_CONTENT_TYPE_ALERT) {
+    } else if (rec.type == PTLS_CONTENT_TYPE_ALERT &&
+               (tls->is_server ? tls->state < PTLS_STATE_POST_HANDSHAKE_MIN : tls->traffic_protection.dec.aead == NULL)) {
+        /* cleartext alerts are accepted under the following conditions:
+         * - when running as a server: until Finished is received, as clients may send alerts in cleartext until then (RFC 9846
+         *   Appendix A.1)
+         * - when running as a client: until handshake keys are obtained, as servers protect everything they send after
+         *   ServerHello (RFC 9846 Section 6, Appendix A.2) */
+    } else if (tls->traffic_protection.dec.aead != NULL) {
         size_t decrypted_length;
         if (rec.type != PTLS_CONTENT_TYPE_APPDATA)
             return PTLS_ALERT_HANDSHAKE_FAILURE;
@@ -5897,6 +6194,12 @@ static int handle_input(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_buffe
                 goto ServerSkipEarlyData;
             return ret;
         }
+        /* skipping of early data ends once a record is deprotected successfully (RFC 9846 Section 4.3.10) */
+        if (tls->is_server)
+            tls->server.early_data_skipped_bytes = UINT32_MAX;
+        /* the full encoded TLSInnerPlaintext MUST NOT exceed 2^14 + 1 octets (RFC 9846 Section 5.4) */
+        if (decrypted_length > PTLS_MAX_PLAINTEXT_RECORD_SIZE + 1)
+            return PTLS_ALERT_RECORD_OVERFLOW;
         rec.length = decrypted_length;
         rec.fragment = decryptbuf->base + decryptbuf->off;
         /* skip padding */
@@ -5906,6 +6209,8 @@ static int handle_input(ptls_t *tls, ptls_message_emitter_t *emitter, ptls_buffe
         if (rec.length == 0)
             return PTLS_ALERT_UNEXPECTED_MESSAGE;
         rec.type = rec.fragment[--rec.length];
+        if (rec.length == 0 && (rec.type == PTLS_CONTENT_TYPE_ALERT || rec.type == PTLS_CONTENT_TYPE_HANDSHAKE))
+            return PTLS_ALERT_UNEXPECTED_MESSAGE;
     } else if (rec.type == PTLS_CONTENT_TYPE_APPDATA && tls->is_server && tls->server.early_data_skipped_bytes != UINT32_MAX) {
         goto ServerSkipEarlyData;
     }
@@ -6012,7 +6317,7 @@ static int handle_input_tls12(ptls_t *tls, ptls_buffer_t *decryptbuf, const void
 Exit:
     ptls_buffer_dispose(&tls->recvbuf.rec);
     ptls_clear_memory(aad, sizeof(aad));
-    return 0;
+    return ret;
 }
 
 static void init_record_message_emitter(ptls_t *tls, struct st_ptls_record_message_emitter_t *emitter, ptls_buffer_t *sendbuf)
@@ -6038,7 +6343,8 @@ int ptls_handshake(ptls_t *tls, ptls_buffer_t *_sendbuf, const void *input, size
         return send_client_hello(tls, &emitter.super, properties, NULL);
     }
     case PTLS_STATE_SERVER_GENERATING_CERTIFICATE_VERIFY:
-        return server_finish_handshake(tls, &emitter.super, 1, NULL);
+        ret = server_finish_handshake(tls, &emitter.super, 1, NULL);
+        goto Exit;
     default:
         break;
     }
@@ -6058,7 +6364,9 @@ int ptls_handshake(ptls_t *tls, ptls_buffer_t *_sendbuf, const void *input, size
     }
 
     ptls_buffer_dispose(&decryptbuf);
+    *inlen -= src_end - src;
 
+Exit:
     switch (ret) {
     case 0:
     case PTLS_ERROR_IN_PROGRESS:
@@ -6080,7 +6388,6 @@ int ptls_handshake(ptls_t *tls, ptls_buffer_t *_sendbuf, const void *input, size
         break;
     }
 
-    *inlen -= src_end - src;
     return ret;
 }
 
@@ -6146,22 +6453,25 @@ Exit:
 
 int ptls_send(ptls_t *tls, ptls_buffer_t *sendbuf, const void *input, size_t inlen)
 {
-    assert(tls->traffic_protection.enc.aead != NULL);
+    if (!(tls->traffic_protection.enc.aead != NULL &&
+          (tls->traffic_protection.enc.tls12 || tls->traffic_protection.enc.epoch == 1 ||
+           tls->traffic_protection.enc.epoch == 3)))
+        return PTLS_ERROR_IN_PROGRESS;
 
     /* "For AES-GCM, up to 2^24.5 full-size records (about 24 million) may be encrypted on a given connection while keeping a
      * safety margin of approximately 2^-57 for Authenticated Encryption (AE) security." (RFC 8446 section 5.5).
      *
      * Key updates do not happen with tls 1.2, check `key_schedule` to see if we are using tls/1.3
      */
-    if (tls->traffic_protection.enc.seq >= 16777216 && tls->key_schedule != NULL)
-        tls->needs_key_update = 1;
+    if (tls->traffic_protection.enc.seq >= 16777216 && tls->key_schedule != NULL &&
+        tls->pending_key_update == PTLS_PENDING_KEY_UPDATE_NONE)
+        tls->pending_key_update = PTLS_PENDING_KEY_UPDATE_SELF;
 
-    if (tls->needs_key_update) {
+    if (tls->pending_key_update != PTLS_PENDING_KEY_UPDATE_NONE) {
         int ret;
-        if ((ret = update_send_key(tls, sendbuf, tls->key_update_send_request)) != 0)
+        if ((ret = update_send_key(tls, sendbuf, tls->pending_key_update == PTLS_PENDING_KEY_UPDATE_SELF_AND_PEER)) != 0)
             return ret;
-        tls->needs_key_update = 0;
-        tls->key_update_send_request = 0;
+        tls->pending_key_update = PTLS_PENDING_KEY_UPDATE_NONE;
     }
 
     return buffer_push_encrypted_records(sendbuf, PTLS_CONTENT_TYPE_APPDATA, input, inlen, &tls->traffic_protection.enc);
@@ -6170,8 +6480,8 @@ int ptls_send(ptls_t *tls, ptls_buffer_t *sendbuf, const void *input, size_t inl
 int ptls_update_key(ptls_t *tls, int request_update)
 {
     assert(tls->ctx->update_traffic_key == NULL);
-    tls->needs_key_update = 1;
-    tls->key_update_send_request = request_update;
+    if (tls->pending_key_update != PTLS_PENDING_KEY_UPDATE_RESPONSE)
+        tls->pending_key_update = request_update ? PTLS_PENDING_KEY_UPDATE_SELF_AND_PEER : PTLS_PENDING_KEY_UPDATE_SELF;
     return 0;
 }
 
@@ -6193,7 +6503,8 @@ int ptls_send_alert(ptls_t *tls, ptls_buffer_t *sendbuf, uint8_t level, uint8_t 
 
     buffer_push_record(sendbuf, PTLS_CONTENT_TYPE_ALERT, { ptls_buffer_push(sendbuf, level, description); });
     /* encrypt the alert if we have the encryption keys, unless when it is the early data key */
-    if (tls->traffic_protection.enc.aead != NULL && !(tls->state <= PTLS_STATE_CLIENT_EXPECT_FINISHED)) {
+    if (tls->traffic_protection.enc.aead != NULL &&
+        (tls->is_server || !(tls->client.using_early_data || tls->pending_handshake_secret != NULL))) {
         if ((ret = buffer_encrypt_record(sendbuf, rec_start, &tls->traffic_protection.enc)) != 0)
             goto Exit;
     }
@@ -6344,6 +6655,10 @@ int ptls_hkdf_expand(ptls_hash_algorithm_t *algo, void *output, size_t outlen, p
     ptls_hash_context_t *hmac = NULL;
     size_t i;
     uint8_t digest[PTLS_MAX_DIGEST_SIZE];
+
+    /* RFC 5869 section 2.3: L <= 255*HashLen, as the block counter is a single octet */
+    if (outlen > 255 * algo->digest_size)
+        return PTLS_ERROR_LIBRARY;
 
     for (i = 0; (i * algo->digest_size) < outlen; ++i) {
         if (hmac == NULL) {
@@ -6951,8 +7266,7 @@ void ptls_log__recalc_point(int caller_locked, struct st_ptls_log_point_t *point
         pthread_mutex_unlock(&logctx.mutex);
 }
 
-void ptls_log__recalc_conn(int caller_locked, struct st_ptls_log_conn_state_t *conn, const char *(*get_sni)(void *),
-                           void *get_sni_arg)
+void ptls_log__recalc_conn(int caller_locked, struct st_ptls_log_conn_state_t *conn, ptls_log_getsni_t getsni)
 {
     if (!caller_locked)
         pthread_mutex_lock(&logctx.mutex);
@@ -6960,7 +7274,7 @@ void ptls_log__recalc_conn(int caller_locked, struct st_ptls_log_conn_state_t *c
     if (conn->state.generation != ptls_log._generation) {
         /* update active bitmap */
         uint32_t new_active = 0;
-        const char *sni = get_sni != NULL ? get_sni(get_sni_arg) : NULL;
+        const char *sni = getsni.cb != NULL ? getsni.cb(getsni.arg) : NULL;
         for (size_t slot = 0; slot < PTLS_ELEMENTSOF(logctx.conns); ++slot) {
             if (logctx.conns[slot].points != NULL && conn->random_ < logctx.conns[slot].sample_ratio &&
                 is_in_stringlist(logctx.conns[slot].snis, sni) &&
@@ -7037,9 +7351,9 @@ void ptls_log__do_push_element_hexdump(const char *prefix, size_t prefix_len, co
     }
 }
 
-void ptls_log__do_push_element_signed32(const char *prefix, size_t prefix_len, int32_t v)
+void ptls_log__do_push_element_signed(const char *prefix, size_t prefix_len, int v)
 {
-    pushf_logbuf_or_invalidate(prefix, prefix_len, sizeof("-2147483648"), "%" PRId32, v);
+    pushf_logbuf_or_invalidate(prefix, prefix_len, sizeof(v) * 3 + 2, "%d", v);
 }
 
 void ptls_log__do_push_element_signed64(const char *prefix, size_t prefix_len, int64_t v)
@@ -7047,14 +7361,20 @@ void ptls_log__do_push_element_signed64(const char *prefix, size_t prefix_len, i
     pushf_logbuf_or_invalidate(prefix, prefix_len, sizeof("-9223372036854775808"), "%" PRId64, v);
 }
 
-void ptls_log__do_push_element_unsigned32(const char *prefix, size_t prefix_len, uint32_t v)
+void ptls_log__do_push_element_unsigned(const char *prefix, size_t prefix_len, unsigned v)
 {
-    pushf_logbuf_or_invalidate(prefix, prefix_len, sizeof("4294967295"), "%" PRIu32, v);
+    pushf_logbuf_or_invalidate(prefix, prefix_len, sizeof(v) * 3 + 1, "%u", v);
 }
 
 void ptls_log__do_push_element_unsigned64(const char *prefix, size_t prefix_len, uint64_t v)
 {
     pushf_logbuf_or_invalidate(prefix, prefix_len, sizeof("18446744073709551615"), "%" PRIu64, v);
+}
+
+void ptls_log__do_push_element_double(const char *prefix, size_t prefix_len, double v)
+{
+    /* .9 is enough precision for logging; 64 bytes is far more than enough, and we have assert in pushf_logbuf_or_invalidate */
+    pushf_logbuf_or_invalidate(prefix, prefix_len, 64, "%.9g", v);
 }
 
 void ptls_log__do_push_element_bool(const char *prefix, size_t prefix_len, int v)
@@ -7113,8 +7433,8 @@ void ptls_log__do_write_start(struct st_ptls_log_point_t *point, int add_time)
     logbuf.buf.off = (size_t)written;
 }
 
-int ptls_log__do_write_end(struct st_ptls_log_point_t *point, struct st_ptls_log_conn_state_t *conn, const char *(*get_sni)(void *),
-                           void *get_sni_arg, int includes_appdata)
+int ptls_log__do_write_end(struct st_ptls_log_point_t *point, struct st_ptls_log_conn_state_t *conn, ptls_log_getsni_t getsni,
+                           int includes_appdata)
 {
     if (!expand_logbuf_or_invalidate("}\n", 2, 0))
         return 0;
@@ -7127,8 +7447,9 @@ int ptls_log__do_write_end(struct st_ptls_log_point_t *point, struct st_ptls_log
     if (point->state.generation != ptls_log._generation)
         ptls_log__recalc_point(1, point);
     uint32_t active = point->state.active_conns;
-    if (conn != NULL && conn->state.generation != ptls_log._generation) {
-        ptls_log__recalc_conn(1, conn, get_sni, get_sni_arg);
+    if (conn != NULL) {
+        if (conn->state.generation != ptls_log._generation)
+            ptls_log__recalc_conn(1, conn, getsni);
         active &= conn->state.active_conns;
     }
 
@@ -7172,15 +7493,29 @@ int ptls_log__do_write_end(struct st_ptls_log_point_t *point, struct st_ptls_log
 
 #endif
 
-void ptls_log_init_conn_state(ptls_log_conn_state_t *state, void (*random_bytes)(void *, size_t))
+void ptls_log_init_conn_state(ptls_log_conn_state_t *state, void (*random_bytes)(void *, size_t), uint64_t conn_id, void *_peeraddr)
 {
+    struct sockaddr *peeraddr = _peeraddr;
     uint32_t r;
     random_bytes(&r, sizeof(r));
 
     *state = (ptls_log_conn_state_t){
         .random_ = (float)r / ((uint64_t)UINT32_MAX + 1), /* [0..1), so that any(r) < sample_ratio where sample_ratio is [0..1] */
         .address = {0}, /* inaddr6_any */
+        .conn_id = conn_id,
     };
+    if (peeraddr != NULL) {
+        switch (peeraddr->sa_family) {
+        case AF_INET: /* store as v6-mapped v4 address */
+            ptls_build_v4_mapped_v6_address(state->address, &((struct sockaddr_in *)peeraddr)->sin_addr);
+            break;
+        case AF_INET6:
+            memcpy(state->address, ((struct sockaddr_in6 *)peeraddr)->sin6_addr.s6_addr, sizeof(state->address));
+            break;
+        default:
+            break;
+        }
+    }
 }
 
 size_t ptls_log_num_lost(void)
