@@ -15,7 +15,11 @@
 #ifndef NORX_H
 #define NORX_H
 
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "winkernel_types.h"
+#endif
 #include <stddef.h>
 
 /**

@@ -2,7 +2,11 @@
 #define HANDY_H
 
 #include <stddef.h>
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "winkernel_types.h"
+#endif
 #include <string.h>
 
 /*

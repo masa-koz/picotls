@@ -15,7 +15,11 @@
 #ifndef SALSA20_H
 #define SALSA20_H
 
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "winkernel_types.h"
+#endif
 #include <stddef.h>
 
 /**

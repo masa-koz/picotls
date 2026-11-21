@@ -3,7 +3,11 @@
  *
  * Original code was public domain. */
 
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "winkernel_types.h"
+#endif
 #include <stddef.h>
 
 #include "handy.h"

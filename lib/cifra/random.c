@@ -19,6 +19,34 @@
  * FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS
  * IN THE SOFTWARE.
  */
+#ifdef _KERNEL_MODE
+
+/* Windows kernel mode: use the system-preferred RNG directly. It is stateless and safe to call concurrently from any thread at
+ * IRQL <= DISPATCH_LEVEL, whereas the DRBG below keeps its state in a PTLS_THREADLOCAL variable, which is a plain global (shared
+ * without locking) in kernel mode. Requires linking with cng.lib. */
+#include "picotls.h"
+#include "picotls/minicrypto.h"
+#include <bcrypt.h>
+
+void ptls_minicrypto_random_bytes(void *buf, size_t len)
+{
+    PUCHAR p = (PUCHAR)buf;
+
+    while (len != 0) {
+        ULONG chunk = len > MAXULONG ? MAXULONG : (ULONG)len;
+        NTSTATUS status = BCryptGenRandom(NULL, p, chunk, BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+        if (!NT_SUCCESS(status)) {
+            DbgPrint("ptls_minicrypto_random_bytes: BCryptGenRandom failed (0x%08x)\n", status);
+            /* never return without filling the buffer; the output is used as key material */
+            PTLS_WINKERNEL_ABORT();
+        }
+        p += chunk;
+        len -= chunk;
+    }
+}
+
+#else /* !_KERNEL_MODE */
+
 #ifndef _XOPEN_SOURCE
 #define _XOPEN_SOURCE 700 /* required for glibc to use getaddrinfo, etc. */
 #endif
@@ -120,3 +148,5 @@ void ptls_minicrypto_random_bytes(void *buf, size_t len)
     }
     cf_hash_drbg_sha256_gen(&ctx, buf, len);
 }
+
+#endif /* _KERNEL_MODE */

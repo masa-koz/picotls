@@ -22,12 +22,14 @@
 #ifdef _WINDOWS
 #include "wincompat.h"
 #endif
+#ifndef _KERNEL_MODE
 #include <assert.h>
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#endif
 #ifndef _WINDOWS
 #include <errno.h>
 #include <pthread.h>
@@ -5350,6 +5352,7 @@ static int parse_record(ptls_t *tls, struct st_ptls_record_t *rec, const uint8_t
     while (tls->recvbuf.rec.off < 5) {
         if (src == end)
             return PTLS_ERROR_IN_PROGRESS;
+        assert(tls->recvbuf.rec.base != NULL);
         tls->recvbuf.rec.base[tls->recvbuf.rec.off++] = *src++;
     }
     if ((ret = parse_record_header(rec, tls->recvbuf.rec.base)) != 0)
@@ -5363,6 +5366,7 @@ static int parse_record(ptls_t *tls, struct st_ptls_record_t *rec, const uint8_t
         if (addlen > (size_t)(end - src))
             addlen = end - src;
         if (addlen != 0) {
+            assert((tls->recvbuf.rec.base + tls->recvbuf.rec.off) != 0);
             memcpy(tls->recvbuf.rec.base + tls->recvbuf.rec.off, src, addlen);
             tls->recvbuf.rec.off += addlen;
             src += addlen;
@@ -6136,6 +6140,7 @@ static int handle_handshake_record(ptls_t *tls,
             ptls_buffer_init(&tls->recvbuf.mess, "", 0);
             if ((ret = ptls_buffer_reserve(&tls->recvbuf.mess, new_size)) != 0)
                 return ret;
+            assert(tls->recvbuf.mess.base != 0);
             memcpy(tls->recvbuf.mess.base, src, new_size);
         } else {
             memmove(tls->recvbuf.mess.base, src, new_size);
@@ -6864,9 +6869,13 @@ int (*volatile ptls_mem_equal)(const void *x, const void *y, size_t len) = mem_e
 
 static uint64_t get_time(ptls_get_time_t *self)
 {
+#ifndef _KERNEL_MODE
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000 + tv.tv_usec / 1000;
+#else
+    return ptls_winkernel_time_epoch_ms();
+#endif
 }
 
 ptls_get_time_t ptls_get_time = {get_time};
@@ -6994,14 +7003,28 @@ int ptls_server_handle_message(ptls_t *tls, ptls_buffer_t *sendbuf, size_t epoch
 int ptls_server_name_is_ipaddr(const char *name)
 {
 #ifdef AF_INET
+#ifndef _KERNEL_MODE
     struct sockaddr_in sin;
     if (inet_pton(AF_INET, name, &sin) == 1)
         return 1;
+#else
+    struct in_addr in_addr;
+    PCHAR terminator_in = NULL;
+    if (RtlIpv4StringToAddressA((PCHAR)name, TRUE, &terminator_in, &in_addr) == STATUS_SUCCESS && *terminator_in == '\0')
+        return 1;
+#endif
 #endif
 #ifdef AF_INET6
+#ifndef _KERNEL_MODE
     struct sockaddr_in6 sin6;
     if (inet_pton(AF_INET6, name, &sin6) == 1)
         return 1;
+#else
+    struct in6_addr in6_addr;
+    PCHAR terminator_in6 = NULL;
+    if (RtlIpv6StringToAddressA((PCHAR)name, &terminator_in6, &in6_addr) == STATUS_SUCCESS && *terminator_in6 == '\0')
+        return 1;
+#endif
 #endif
     return 0;
 }

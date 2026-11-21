@@ -20,6 +20,10 @@
 #include "handy.h"
 #include "tassert.h"
 
+#ifdef _KERNEL_MODE
+#define abort() PTLS_WINKERNEL_ABORT()
+#endif
+
 static const uint64_t K[80] = {
   UINT64_C(0x428a2f98d728ae22), UINT64_C(0x7137449123ef65cd),
   UINT64_C(0xb5c0fbcfec4d3b2f), UINT64_C(0xe9b5dba58189dbbc),

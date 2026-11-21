@@ -15,7 +15,11 @@
 #ifndef BLOCKWISE_H
 #define BLOCKWISE_H
 
+#ifndef _KERNEL_MODE
 #include <stdint.h>
+#else
+#include "winkernel_types.h"
+#endif
 #include <stddef.h>
 
 /* Processing function for cf_blockwise_accumulate. */
