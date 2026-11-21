@@ -7496,6 +7496,15 @@ int ptls_log__do_write_end(struct st_ptls_log_point_t *point, struct st_ptls_log
 void ptls_log_init_conn_state(ptls_log_conn_state_t *state, void (*random_bytes)(void *, size_t), uint64_t conn_id, void *_peeraddr)
 {
     struct sockaddr *peeraddr = _peeraddr;
+#ifdef _KERNEL_MODE
+    /* Kernel code must not touch the FPU without saving its state, and log sampling is not available in kernel mode, so
+     * `random_` is left zero. */
+    (void)random_bytes;
+    *state = (ptls_log_conn_state_t){
+        .address = {0}, /* inaddr6_any */
+        .conn_id = conn_id,
+    };
+#else
     uint32_t r;
     random_bytes(&r, sizeof(r));
 
@@ -7504,6 +7513,7 @@ void ptls_log_init_conn_state(ptls_log_conn_state_t *state, void (*random_bytes)
         .address = {0}, /* inaddr6_any */
         .conn_id = conn_id,
     };
+#endif
     if (peeraddr != NULL) {
         switch (peeraddr->sa_family) {
         case AF_INET: /* store as v6-mapped v4 address */
