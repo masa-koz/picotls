@@ -7500,10 +7500,8 @@ void ptls_log_init_conn_state(ptls_log_conn_state_t *state, void (*random_bytes)
     /* Kernel code must not touch the FPU without saving its state, and log sampling is not available in kernel mode, so
      * `random_` is left zero. */
     (void)random_bytes;
-    *state = (ptls_log_conn_state_t){
-        .address = {0}, /* inaddr6_any */
-        .conn_id = conn_id,
-    };
+    memset(state, 0, sizeof(*state)); /* address = inaddr6_any; no float expression, not even a zero initializer */
+    state->conn_id = conn_id;
 #else
     uint32_t r;
     random_bytes(&r, sizeof(r));
