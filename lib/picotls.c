@@ -51,6 +51,16 @@
 #include "picotls-probes.h"
 #endif
 
+/**
+ * Tells the Microsoft static analyzer what an assert() states, for the Release builds where NDEBUG removes the assert and
+ * the analyzer (run as part of Windows kernel-mode builds) would otherwise report a false positive.
+ */
+#ifdef _MSC_VER
+#define PTLS_ANALYSIS_ASSUME(expr) _Analysis_assume_(expr)
+#else
+#define PTLS_ANALYSIS_ASSUME(expr) ((void)0)
+#endif
+
 #define PTLS_MAX_PLAINTEXT_RECORD_SIZE 16384
 #define PTLS_MAX_ENCRYPTED_RECORD_SIZE (16384 + 256)
 
@@ -5353,6 +5363,7 @@ static int parse_record(ptls_t *tls, struct st_ptls_record_t *rec, const uint8_t
         if (src == end)
             return PTLS_ERROR_IN_PROGRESS;
         assert(tls->recvbuf.rec.base != NULL);
+        PTLS_ANALYSIS_ASSUME(tls->recvbuf.rec.base != NULL);
         tls->recvbuf.rec.base[tls->recvbuf.rec.off++] = *src++;
     }
     if ((ret = parse_record_header(rec, tls->recvbuf.rec.base)) != 0)
@@ -5367,6 +5378,7 @@ static int parse_record(ptls_t *tls, struct st_ptls_record_t *rec, const uint8_t
             addlen = end - src;
         if (addlen != 0) {
             assert((tls->recvbuf.rec.base + tls->recvbuf.rec.off) != 0);
+            PTLS_ANALYSIS_ASSUME((tls->recvbuf.rec.base + tls->recvbuf.rec.off) != NULL);
             memcpy(tls->recvbuf.rec.base + tls->recvbuf.rec.off, src, addlen);
             tls->recvbuf.rec.off += addlen;
             src += addlen;
@@ -6141,6 +6153,7 @@ static int handle_handshake_record(ptls_t *tls,
             if ((ret = ptls_buffer_reserve(&tls->recvbuf.mess, new_size)) != 0)
                 return ret;
             assert(tls->recvbuf.mess.base != 0);
+            PTLS_ANALYSIS_ASSUME(tls->recvbuf.mess.base != NULL);
             memcpy(tls->recvbuf.mess.base, src, new_size);
         } else {
             memmove(tls->recvbuf.mess.base, src, new_size);
