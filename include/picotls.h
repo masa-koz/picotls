@@ -2056,6 +2056,7 @@ inline uint32_t ptls_log_point_maybe_active(struct st_ptls_log_point_t *point)
         ptls_log__recalc_point(0, point);
     return point->state.active_conns;
 #else
+    (void)point;
     return 0;
 #endif
 }
@@ -2072,6 +2073,8 @@ inline uint32_t ptls_log_conn_maybe_active(ptls_log_conn_state_t *conn, ptls_log
         ptls_log__recalc_conn(0, conn, getsni);
     return conn->state.active_conns;
 #else
+    (void)conn;
+    (void)getsni;
     return 0;
 #endif
 }
